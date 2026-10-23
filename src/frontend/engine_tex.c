@@ -239,21 +239,21 @@ static void pop_process(fz_context *ctx, struct tex_engine *self)
   log_rollback(ctx, self->log, mark);
 }
 
-static void clear_convergence_stash(fz_context *ctx, struct tex_engine *self)
+// An edit cancels a finishing pass in progress, but keeps the stashed
+// auxiliary files (edit_data_from_convergence). Every snapshot of the pass
+// that installed them was taken while reading them (the engine forks on
+// reads), so a rollback may resume a process in the middle of one, e.g. at
+// byte 2049 of the .aux: dropping the stash left that read with no data and
+// the driver crashed on it (data == NULL in Q_READ). Kept, a rerun stays
+// deterministic: the re-run reads what the snapshots read. The next
+// finish_convergence replaces the stash.
+static void cancel_convergence(struct tex_engine *self)
 {
-  fileentry_t *e;
-  for (int index = 0; (e = filesystem_scan(self->fs, &index));)
-  {
-    if (e->edit_data_from_convergence && e->edit_data)
-    {
-      fz_drop_buffer(ctx, e->edit_data);
-      e->edit_data = NULL;
-      e->edit_data_from_convergence = false;
-    }
-  }
   self->aux_dirty = false;
   self->finishing = false;
 }
+
+static void reset_seen_for_respawn(struct tex_engine *self);
 
 static bool read_query(struct tex_engine *self, channel_t *t, query_t *q)
 {
@@ -986,7 +986,7 @@ static void revert_trace(trace_entry_t *te)
 static void rollback_processes(fz_context *ctx, struct tex_engine *self, int reverted, int trace)
 {
   self->deferred.active = false;
-  clear_convergence_stash(ctx, self);
+  cancel_convergence(self);
 
   fprintf(
     stderr,
@@ -1021,12 +1021,24 @@ static void rollback_processes(fz_context *ctx, struct tex_engine *self, int rev
   while (self->process_count > 0 && get_process(self)->trace_len > trace)
     pop_process(ctx, self);
 
+  // A process at the top of the stack that is dead cannot be resumed. It is
+  // dead when the worker was killed as stuck (process_pending_messages) at the
+  // very position rolled back to, which the loop above does not pop: an edit
+  // arriving while a freshly spawned worker (at start-up, or for a rerun pass)
+  // had not answered yet left the root process dead and TeX never ran again.
+  // Drop such processes, as finish_convergence does; with none left, the next
+  // engine_step (restart_if_needed) spawns a new one.
+  while (self->process_count > 0 && get_process(self)->fd == -1)
+    pop_process(ctx, self);
+
   int trace_len = self->process_count == 0 ? 0 : get_process(self)->trace_len;
   while (reverted > trace_len)
   {
     reverted--;
     revert_trace(&self->trace[reverted]);
   }
+  if (self->process_count == 0)
+    reset_seen_for_respawn(self);
 
   fprintf(stderr, "after rollback: %d bytes of output\n",
     self->st.document.entry
