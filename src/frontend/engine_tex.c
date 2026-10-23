@@ -1512,19 +1512,13 @@ static void engine_finish_convergence(txp_engine *_self, fz_context *ctx)
   {
     fprintf(stderr, "[rerun] aux byte-stable, convergence reached\n");
     // Finishing left the latest process dead (fd=-1) at the top of the
-    // snapshot stack. Strip dead processes so get_process() returns a
-    // live snapshot the next user edit can roll back into.
-    while (self->process_count > 0 && get_process(self)->fd == -1)
-      pop_process(ctx, self);
-    if (self->process_count == 0)
-    {
-      reset_seen_for_respawn(self);
-      incdvi_reset(self->dvi);
-      synctex_rollback(ctx, self->stex, 0);
-      editor_truncate(BUF_OUT, output_data(self->st.stdout.entry));
-      editor_truncate(BUF_LOG, output_data(self->st.log.entry));
-      prepare_process(ctx, self);
-    }
+    // snapshot stack. Leave it there: the next edit pops it in
+    // rollback_processes. Popping it here rolled the document back to the
+    // last live snapshot behind the viewer's back: the viewer kept the page
+    // index of the finished pass and drew a page past the end of the
+    // truncated document (abort in incdvi_render_page, seen on page 33 of a
+    // 46-page deck), and the engine re-ran the tail of the document after
+    // every converged pass.
     self->aux_dirty = false;
     return;
   }
