@@ -997,9 +997,178 @@ static void export_highlight(fz_context *ctx, ui_state *ui, fz_pixmap *pix, fz_m
   fz_free(ctx, mask);
 }
 
-// Write the displayed page as a PNG fitted to the box asked for by
-// render-to, through a temporary file renamed in place (a reader never sees
-// half an image), then tell the editor.
+static int sixel_bucket(const uint8_t *p)
+{
+  return ((p[0] >> 3) << 10) | ((p[1] >> 3) << 5) | (p[2] >> 3);
+}
+
+struct sixel_bucket_count { int count, bucket; };
+
+static int sixel_bucket_cmp(const void *a, const void *b)
+{
+  int ca = ((const struct sixel_bucket_count *)a)->count;
+  int cb = ((const struct sixel_bucket_count *)b)->count;
+  return (cb > ca) - (cb < ca);
+}
+
+static void sixel_run(FILE *f, int ch, int n)
+{
+  if (n > 3)
+    fprintf(f, "!%d%c", n, ch);
+  else
+    while (n-- > 0)
+      fputc(ch, f);
+}
+
+// Write PIX (RGB, no alpha) as a Sixel picture, for an editor in a
+// terminal.  Colours are read at 5 bits a channel; the 256 most frequent
+// make the palette (a page is mostly paper, ink and their blends), each
+// drawn in the mean of its pixels, and every pixel takes the nearest.
+static void save_pixmap_as_sixel(fz_context *ctx, fz_pixmap *pix, const char *path)
+{
+  enum { BUCKETS = 1 << 15, COLORS = 256 };
+  int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
+  int stride = fz_pixmap_stride(ctx, pix);
+  const uint8_t *samples = fz_pixmap_samples(ctx, pix);
+  int *count = NULL, *map = NULL;
+  struct sixel_bucket_count *order = NULL;
+  int64_t *sum = NULL;
+  uint8_t *index = NULL, *bits = NULL;
+  FILE *f = NULL;
+  fz_var(count); fz_var(order); fz_var(map); fz_var(sum);
+  fz_var(index); fz_var(bits); fz_var(f);
+  fz_try(ctx)
+  {
+    count = fz_calloc(ctx, BUCKETS, sizeof(int));
+    sum = fz_calloc(ctx, BUCKETS * 3, sizeof(int64_t));
+    for (int y = 0; y < h; ++y)
+    {
+      const uint8_t *p = samples + (size_t)stride * y;
+      for (int x = 0; x < w; ++x, p += 3)
+      {
+        int b = sixel_bucket(p);
+        count[b]++;
+        for (int c = 0; c < 3; ++c)
+          sum[b * 3 + c] += p[c];
+      }
+    }
+
+    order = fz_calloc(ctx, BUCKETS, sizeof(*order));
+    int used = 0;
+    for (int b = 0; b < BUCKETS; ++b)
+      if (count[b])
+        order[used++] = (struct sixel_bucket_count){count[b], b};
+    qsort(order, used, sizeof(*order), sixel_bucket_cmp);
+    int ncolors = fz_mini(used, COLORS);
+    uint8_t palette[COLORS][3];
+    map = fz_calloc(ctx, BUCKETS, sizeof(int));
+    for (int i = 0; i < ncolors; ++i)
+    {
+      int b = order[i].bucket;
+      for (int c = 0; c < 3; ++c)
+        palette[i][c] = (sum[b * 3 + c] + count[b] / 2) / count[b];
+      map[b] = i;
+    }
+    for (int i = ncolors; i < used; ++i)
+    {
+      int b = order[i].bucket, best = 0, best_d = INT32_MAX;
+      int rgb[3];
+      for (int c = 0; c < 3; ++c)
+        rgb[c] = (sum[b * 3 + c] + count[b] / 2) / count[b];
+      for (int j = 0; j < ncolors; ++j)
+      {
+        int d = 0;
+        for (int c = 0; c < 3; ++c)
+          d += (rgb[c] - palette[j][c]) * (rgb[c] - palette[j][c]);
+        if (d < best_d)
+          best_d = d, best = j;
+      }
+      map[b] = best;
+    }
+
+    index = fz_malloc(ctx, (size_t)w * h);
+    for (int y = 0; y < h; ++y)
+    {
+      const uint8_t *p = samples + (size_t)stride * y;
+      for (int x = 0; x < w; ++x, p += 3)
+        index[(size_t)y * w + x] = map[sixel_bucket(p)];
+    }
+
+    f = fopen(path, "wb");
+    if (!f)
+      fz_throw(ctx, FZ_ERROR_GENERIC, "cannot open %s: %s", path, strerror(errno));
+    // P2 = 1: pixels not drawn keep what is under them (every pixel is drawn)
+    fprintf(f, "\033P0;1;0q\"1;1;%d;%d", w, h);
+    for (int i = 0; i < ncolors; ++i)
+      fprintf(f, "#%d;2;%d;%d;%d", i, (palette[i][0] * 100 + 127) / 255,
+              (palette[i][1] * 100 + 127) / 255, (palette[i][2] * 100 + 127) / 255);
+
+    // Six rows at a time: for each colour of the band, the column's bits
+    // that are in it, written from its first column to its last.
+    bits = fz_calloc(ctx, (size_t)COLORS * w, 1);
+    int lo[COLORS], hi[COLORS];
+    for (int y0 = 0; y0 < h; y0 += 6)
+    {
+      for (int i = 0; i < ncolors; ++i)
+        lo[i] = w, hi[i] = -1;
+      for (int dy = 0; dy < 6 && y0 + dy < h; ++dy)
+      {
+        const uint8_t *row = index + (size_t)(y0 + dy) * w;
+        for (int x = 0; x < w; ++x)
+        {
+          int i = row[x];
+          bits[(size_t)i * w + x] |= 1 << dy;
+          if (x < lo[i]) lo[i] = x;
+          if (x > hi[i]) hi[i] = x;
+        }
+      }
+      bool first = true;
+      for (int i = 0; i < ncolors; ++i)
+      {
+        if (hi[i] < 0)
+          continue;
+        if (!first)
+          fputc('$', f);
+        first = false;
+        fprintf(f, "#%d", i);
+        sixel_run(f, '?', lo[i]);
+        uint8_t *b = bits + (size_t)i * w;
+        for (int x = lo[i]; x <= hi[i];)
+        {
+          int x1 = x + 1;
+          while (x1 <= hi[i] && b[x1] == b[x])
+            ++x1;
+          sixel_run(f, 63 + b[x], x1 - x);
+          x = x1;
+        }
+        memset(b + lo[i], 0, hi[i] - lo[i] + 1);
+      }
+      if (y0 + 6 < h)
+        fputc('-', f);
+    }
+    fputs("\033\\", f);
+    if (ferror(f))
+      fz_throw(ctx, FZ_ERROR_GENERIC, "cannot write %s", path);
+  }
+  fz_always(ctx)
+  {
+    if (f && fclose(f) != 0)
+      fprintf(stderr, "[export] cannot close %s: %s\n", path, strerror(errno));
+    fz_free(ctx, count);
+    fz_free(ctx, sum);
+    fz_free(ctx, order);
+    fz_free(ctx, map);
+    fz_free(ctx, index);
+    fz_free(ctx, bits);
+  }
+  fz_catch(ctx)
+    fz_rethrow(ctx);
+}
+
+// Write the displayed page as a PNG (a Sixel picture when the path ends in
+// ".six") fitted to the box asked for by render-to, through a temporary
+// file renamed in place (a reader never sees half an image), then tell the
+// editor.
 static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_list *dl)
 {
   if (!ui->export_path || ui->export_width <= 0 || ui->export_height <= 0)
@@ -1039,7 +1208,11 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
     size_t n = strlen(ui->export_path) + 5;
     tmp = fz_malloc(ctx, n);
     snprintf(tmp, n, "%s.tmp", ui->export_path);
-    fz_save_pixmap_as_png(ctx, pix, tmp);
+    size_t len = strlen(ui->export_path);
+    if (len > 4 && strcmp(ui->export_path + len - 4, ".six") == 0)
+      save_pixmap_as_sixel(ctx, pix, tmp);
+    else
+      fz_save_pixmap_as_png(ctx, pix, tmp);
     if (rename(tmp, ui->export_path) != 0)
       fz_throw(ctx, FZ_ERROR_GENERIC, "cannot rename %s: %s", tmp, strerror(errno));
 

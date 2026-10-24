@@ -142,6 +142,7 @@ struct editor_command
 
     // Write the displayed page as a PNG at `path`, fitted to width x height
     // pixels, after every change; an empty path or a zero size stops it.
+    // A path ending in ".six" gets a Sixel picture instead, for a terminal.
     struct {
       const char *path;
       int width, height;
