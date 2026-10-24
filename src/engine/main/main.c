@@ -62,6 +62,16 @@ NORETURN PRINTF_FUNC(1, 2) int _tt_abort(const char *format, ...)
   vfprintf(stderr, format, ap);
   va_end(ap);
   fprintf(stderr, "\n");
+  // _tt_abort ends a TeX job that the document stopped: an emergency stop
+  // (an argument left open to the end of the file, a missing \end), TeX's
+  // capacity exceeded, a hundred errors. Under TeXpresso that happens all the
+  // time while text is typed, and the driver copes: it keeps the pages typeset
+  // so far and runs TeX again after the next change. So exit without a core
+  // dump: abort() made each of them look like a crash to the system. _exit,
+  // not exit: a forked snapshot must not flush stdio buffers it shares with
+  // the process it was forked from.
+  if (texpresso)
+    _exit(EXIT_FAILURE);
   do_abort();
 }
 
