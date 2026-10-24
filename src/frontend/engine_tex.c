@@ -87,6 +87,10 @@ struct tex_engine
   int fence_pos;
   mark_t restart;
 
+  // TeX's time (tokens read) at the last edit, -1 before any: the snapshots
+  // just before it are kept when the stack is thinned.
+  int focus_time;
+
   incdvi_t *dvi;
   synctex_t *stex;
 
@@ -267,42 +271,57 @@ static bool read_query(struct tex_engine *self, channel_t *t, query_t *q)
   return result;
 }
 
+// Thin the snapshot stack once it is full. An edit restarts TeX from the
+// last snapshot before it, so what an edit costs is the TeX time from that
+// snapshot to the edit. The first and the running process stay, and so do the
+// NEAR_FOCUS snapshots just before the last edit (its fences put them there,
+// and the next edit is most likely nearby); of the others, the one whose
+// removal leaves the shortest gap in TeX's time goes, until KEEP are left, so
+// that the snapshots end up evenly spread over the document and no edit
+// restarts far from its page.
 static void decimate_processes(struct tex_engine *self)
 {
+  enum { KEEP = 24, NEAR_FOCUS = 6 };
+  int n = self->process_count;
+  int time[MAX_PROCESS];
   bool keep[MAX_PROCESS] = {0,};
+  bool fixed[MAX_PROCESS] = {0,};
 
-  int target = 32;
-  fprintf(stderr, "before process decimation:\n");
-  for  (int i = 0; i < self->process_count; ++i)
+  fprintf(stderr, "before process decimation (focus at time %d):\n", self->focus_time);
+  for (int i = 0; i < n; ++i)
   {
     process_t *p = &self->processes[i];
-    fprintf(stderr, "- position %d, time %dms [pid %d]\n",
-            p->trace_len,
-            p->trace_len == 0 ? 0 : self->trace[p->trace_len - 1].time,
-            p->pid);
-    if (p->trace_len >= target)
-    {
-        keep[i] = true;
-        target *= 2;
-    }
+    time[i] = p->trace_len == 0 ? 0 : self->trace[p->trace_len - 1].time;
+    keep[i] = true;
+    fprintf(stderr, "- position %d, time %d [pid %d]\n", p->trace_len, time[i], p->pid);
   }
 
-  target = self->processes[self->process_count - 1].trace_len;
-  int delta = 32;
-  for (int i = self->process_count - 1; i >= 0; --i)
+  fixed[0] = fixed[n - 1] = true;
+  if (self->focus_time >= 0)
+    for (int i = n - 2, near = 0; i > 0 && near < NEAR_FOCUS; --i)
+      if (time[i] <= self->focus_time)
+        fixed[i] = true, near++;
+
+  for (int count = n; count > KEEP; --count)
   {
-    process_t *p = &self->processes[i];
-    if (p->trace_len <= target)
+    int best = -1, best_gap = INT_MAX;
+    for (int i = 1, prev = 0; i < n - 1; ++i)
     {
-      keep[i] = true;
-      delta *= 2;
-      target -= delta;
+      if (!keep[i])
+        continue;
+      if (!fixed[i])
+      {
+        int next = i + 1;
+        while (!keep[next])
+          next++;
+        if (time[next] - time[prev] < best_gap)
+          best_gap = time[next] - time[prev], best = i;
+      }
+      prev = i;
     }
-    else if (keep[i])
-    {
-      delta *= 2;
-      target = p->trace_len - delta;
-    }
+    if (best < 0)
+      break;
+    keep[best] = false;
   }
 
   int i = 0;
@@ -1646,6 +1665,8 @@ static bool engine_end_changes(txp_engine *_self, fz_context *ctx)
   if (!rollback_end(ctx, self, &reverted, &offset))
     return false;
 
+  if (reverted >= 0 && self->process_count > 0 && reverted < get_process(self)->trace_len)
+    self->focus_time = self->trace[reverted].time;
   trace = reverted >= 0 ? compute_fences(ctx, self, reverted, offset) : 0;
   rollback_processes(ctx, self, reverted, trace);
 
@@ -1698,6 +1719,7 @@ txp_engine *txp_create_tex_engine(fz_context *ctx,
   self->fs = filesystem_new(ctx);
   self->log = log_new(ctx);
   self->trace = NULL;
+  self->focus_time = -1;
   self->trace_cap = 0;
   self->fence_pos = -1;
   self->restart = log_snapshot(ctx, self->log);
