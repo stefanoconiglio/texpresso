@@ -320,6 +320,55 @@ bool editor_parse(fz_context *ctx,
       goto arity;
     *out = (struct editor_command){.tag = EDIT_RERUN_ONCE, .rerun_once = {}};
   }
+  else if (strcmp(verb, "render-to") == 0)
+  {
+    if (len != 4)
+      goto arity;
+    val path = val_array_get(ctx, stack, command, 1);
+    val width = val_array_get(ctx, stack, command, 2);
+    val height = val_array_get(ctx, stack, command, 3);
+    if (!val_is_string(path) || !val_is_number(width) || !val_is_number(height))
+      goto arguments;
+    *out = (struct editor_command){
+        .tag = EDIT_RENDER_TO,
+        .render_to = {
+            .path = val_string(ctx, stack, path),
+            .width = val_number(ctx, width),
+            .height = val_number(ctx, height),
+        }};
+  }
+  else if (strcmp(verb, "click-at") == 0)
+  {
+    if (len != 3)
+      goto arity;
+    val x = val_array_get(ctx, stack, command, 1);
+    val y = val_array_get(ctx, stack, command, 2);
+    if (!val_is_number(x) || !val_is_number(y))
+      goto arguments;
+    *out = (struct editor_command){
+        .tag = EDIT_CLICK_AT,
+        .click_at = {.x = val_number(ctx, x), .y = val_number(ctx, y)}};
+  }
+  else if (strcmp(verb, "select") == 0)
+  {
+    if (len != 5)
+      goto arity;
+    val v[4];
+    for (int i = 0; i < 4; ++i)
+    {
+      v[i] = val_array_get(ctx, stack, command, i + 1);
+      if (!val_is_number(v[i]))
+        goto arguments;
+    }
+    *out = (struct editor_command){
+        .tag = EDIT_SELECT,
+        .select = {
+            .x0 = val_number(ctx, v[0]),
+            .y0 = val_number(ctx, v[1]),
+            .x1 = val_number(ctx, v[2]),
+            .y1 = val_number(ctx, v[3]),
+        }};
+  }
   else
   {
     fprintf(stderr, "[command] unknown verb: %s\n", verb);
@@ -619,6 +668,40 @@ void editor_notify_file_opened(int index, const char *path, int len)
       break;
   }
   output_data_string(stdout, path, len);
+  switch (protocol)
+  {
+    case EDITOR_SEXP: fprintf(stdout, "\")\n"); break;
+    case EDITOR_JSON: fprintf(stdout, "\"]\n"); break;
+  }
+}
+
+void editor_page_image(const char *path, int page, int page_count, int width, int height)
+{
+  switch (protocol)
+  {
+    case EDITOR_SEXP: fprintf(stdout, "(page-image \""); break;
+    case EDITOR_JSON: fprintf(stdout, "[\"page-image\", \""); break;
+  }
+  output_data_string(stdout, path, strlen(path));
+  switch (protocol)
+  {
+    case EDITOR_SEXP:
+      fprintf(stdout, "\" %d %d %d %d)\n", page, page_count, width, height);
+      break;
+    case EDITOR_JSON:
+      fprintf(stdout, "\", %d, %d, %d, %d]\n", page, page_count, width, height);
+      break;
+  }
+}
+
+void editor_selected_text(const char *text)
+{
+  switch (protocol)
+  {
+    case EDITOR_SEXP: fprintf(stdout, "(selected-text \""); break;
+    case EDITOR_JSON: fprintf(stdout, "[\"selected-text\", \""); break;
+  }
+  output_data_string(stdout, text, strlen(text));
   switch (protocol)
   {
     case EDITOR_SEXP: fprintf(stdout, "\")\n"); break;

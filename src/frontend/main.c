@@ -114,6 +114,19 @@ typedef struct {
   uint32_t last_click_ticks;
   enum ui_mouse_status mouse_status;
   bool advancing;
+
+  // Export of the displayed page as a PNG (render-to), for an editor that
+  // shows it itself: the file, the box to fit it in, and the mapping of the
+  // last image written (for click-at).
+  char *export_path;
+  int export_width, export_height;
+  bool export_valid;
+  float export_scale;
+  fz_rect export_bounds;
+  fz_display_list *export_dl;   // the page of the last image, for select
+  // The selection highlighted in the image (select), on page sel_page
+  fz_quad sel_quads[512];
+  int sel_count, sel_page;
 } ui_state;
 
 /* UI rendering */
@@ -917,10 +930,147 @@ static uint32_t convert_color(fz_context *ctx, vstack *stack, float frgb[3])
   return (rgb[0] << 16) | (rgb[1] << 8) | (rgb[2]);
 }
 
+// The colours the window paints with (the editor's theme, maybe inverted):
+// ink goes to fg, paper to bg, as in the renderer.
+static void export_recolor(fz_context *ctx, ui_state *ui, fz_pixmap *pix)
+{
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  uint32_t bg = 0xFFFFFF, fg = 0x000000;
+  if (config->themed_color)
+  {
+    bg = config->background_color & 0xFFFFFF;
+    fg = config->foreground_color & 0xFFFFFF;
+  }
+  if (config->invert_color)
+  {
+    uint32_t tmp = fg;
+    fg = bg;
+    bg = tmp;
+  }
+  if (bg == 0xFFFFFF && fg == 0x000000)
+    return;
+
+  uint8_t ink[3] = {(fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF};
+  uint8_t paper[3] = {(bg >> 16) & 0xFF, (bg >> 8) & 0xFF, bg & 0xFF};
+  uint8_t *samples = fz_pixmap_samples(ctx, pix);
+  int stride = fz_pixmap_stride(ctx, pix);
+  int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
+  for (int y = 0; y < h; ++y)
+  {
+    uint8_t *p = samples + stride * y;
+    for (int x = 0; x < w; ++x, p += 3)
+      for (int c = 0; c < 3; ++c)
+        p[c] = ink[c] + (p[c] * (paper[c] - ink[c])) / 255;
+  }
+}
+
+// Tint the selected text (sel_quads, page coordinates) towards the ink
+// colour, a third of the way, so it reads as highlighted on any theme.
+static void export_highlight(fz_context *ctx, ui_state *ui, fz_pixmap *pix, fz_matrix ctm)
+{
+  txp_renderer_config *config = txp_renderer_get_config(ctx, ui->doc_renderer);
+  uint32_t fg = config->themed_color ? config->foreground_color & 0xFFFFFF : 0;
+  uint8_t ink[3] = {(fg >> 16) & 0xFF, (fg >> 8) & 0xFF, fg & 0xFF};
+  uint8_t *samples = fz_pixmap_samples(ctx, pix);
+  int stride = fz_pixmap_stride(ctx, pix);
+  int w = fz_pixmap_width(ctx, pix), h = fz_pixmap_height(ctx, pix);
+  // Mark first, tint once: the rectangles of adjacent lines overlap
+  uint8_t *mask = fz_calloc(ctx, (size_t)w * h, 1);
+  for (int i = 0; i < ui->sel_count; ++i)
+  {
+    fz_irect r = fz_irect_from_rect(
+        fz_transform_rect(fz_rect_from_quad(ui->sel_quads[i]), ctm));
+    int x0 = fz_maxi(r.x0, 0), y0 = fz_maxi(r.y0, 0);
+    int x1 = fz_mini(r.x1, w), y1 = fz_mini(r.y1, h);
+    for (int y = y0; y < y1; ++y)
+      if (x1 > x0)
+        memset(mask + (size_t)y * w + x0, 1, x1 - x0);
+  }
+  for (int y = 0; y < h; ++y)
+  {
+    uint8_t *p = samples + stride * y, *m = mask + (size_t)y * w;
+    for (int x = 0; x < w; ++x, p += 3)
+      if (m[x])
+        for (int c = 0; c < 3; ++c)
+          p[c] = p[c] + (ink[c] - p[c]) / 3;
+  }
+  fz_free(ctx, mask);
+}
+
+// Write the displayed page as a PNG fitted to the box asked for by
+// render-to, through a temporary file renamed in place (a reader never sees
+// half an image), then tell the editor.
+static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_list *dl)
+{
+  if (!ui->export_path || ui->export_width <= 0 || ui->export_height <= 0)
+    return;
+
+  fz_context *ctx = ps->ctx;
+  fz_pixmap *pix = NULL;
+  fz_device *dev = NULL;
+  char *tmp = NULL;
+  fz_var(pix);
+  fz_var(dev);
+  fz_var(tmp);
+  fz_try(ctx)
+  {
+    fz_rect b = fz_bound_display_list(ctx, dl);
+    float bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+    if (bw <= 0 || bh <= 0)
+      fz_throw(ctx, FZ_ERROR_GENERIC, "empty page");
+    float scale = fz_min(ui->export_width / bw, ui->export_height / bh);
+    int pw = fz_maxi(1, (int)(bw * scale + 0.5f));
+    int ph = fz_maxi(1, (int)(bh * scale + 0.5f));
+
+    pix = fz_new_pixmap(ctx, fz_device_rgb(ctx), pw, ph, NULL, 0);
+    fz_clear_pixmap_with_value(ctx, pix, 255);
+    fz_matrix ctm = fz_pre_translate(fz_scale(scale, scale), -b.x0, -b.y0);
+    dev = fz_new_draw_device(ctx, ctm, pix);
+    fz_run_display_list(ctx, dl, dev, fz_identity, fz_infinite_rect, NULL);
+    fz_close_device(ctx, dev);
+    export_recolor(ctx, ui, pix);
+    // A selection belongs to the contents it was made on: another page, or
+    // the same page typeset again after an edit, drops it.
+    if (ui->sel_count > 0 && (ui->sel_page != ui->page || dl != ui->export_dl))
+      ui->sel_count = 0;
+    if (ui->sel_count > 0)
+      export_highlight(ctx, ui, pix, ctm);
+
+    size_t n = strlen(ui->export_path) + 5;
+    tmp = fz_malloc(ctx, n);
+    snprintf(tmp, n, "%s.tmp", ui->export_path);
+    fz_save_pixmap_as_png(ctx, pix, tmp);
+    if (rename(tmp, ui->export_path) != 0)
+      fz_throw(ctx, FZ_ERROR_GENERIC, "cannot rename %s: %s", tmp, strerror(errno));
+
+    ui->export_valid = true;
+    ui->export_scale = scale;
+    ui->export_bounds = b;
+    if (ui->export_dl != dl)
+    {
+      fz_drop_display_list(ctx, ui->export_dl);
+      ui->export_dl = fz_keep_display_list(ctx, dl);
+    }
+    editor_page_image(ui->export_path, ui->page, send(page_count, ui->eng), pw, ph);
+    fflush(stdout);
+  }
+  fz_always(ctx)
+  {
+    fz_drop_device(ctx, dev);
+    fz_drop_pixmap(ctx, pix);
+    fz_free(ctx, tmp);
+  }
+  fz_catch(ctx)
+  {
+    fprintf(stderr, "[export] %s\n", fz_caught_message(ctx));
+  }
+}
+
 static void display_page(struct persistent_state *ps, ui_state *ui)
 {
   fz_display_list *dl = send(render_page, ui->eng, ps->ctx, ui->page);
   txp_renderer_set_contents(ps->ctx, ui->doc_renderer, dl);
+  export_page(ps, ui, dl);
   fz_drop_display_list(ps->ctx, dl);
   schedule_event(RENDER_EVENT);
 }
@@ -1134,6 +1284,88 @@ static void interpret_command(struct persistent_state *ps,
       fprintf(stderr, "[command] rerun-once: pending immediate pass\n");
       schedule_event(SCAN_EVENT);
       break;
+
+    case EDIT_RENDER_TO:
+    {
+      free(ui->export_path);
+      ui->export_path = NULL;
+      ui->export_valid = false;
+      ui->export_width = cmd.render_to.width;
+      ui->export_height = cmd.render_to.height;
+      if (cmd.render_to.path[0] && ui->export_width > 0 && ui->export_height > 0)
+      {
+        ui->export_path = strdup(cmd.render_to.path);
+        // Write the page on display at once, at the new size
+        if (ui->page < send(page_count, ui->eng))
+          display_page(ps, ui);
+      }
+      fprintf(stderr, "[command] render-to %s %dx%d\n",
+              ui->export_path ? ui->export_path : "(off)",
+              ui->export_width, ui->export_height);
+    }
+    break;
+
+    case EDIT_SELECT:
+    {
+      if (!ui->export_valid || !ui->export_dl)
+        break;
+      fz_context *ctx = ps->ctx;
+      fz_rect b = ui->export_bounds;
+      float s = ui->export_scale;
+      fz_point a = fz_make_point(b.x0 + cmd.select.x0 / s, b.y0 + cmd.select.y0 / s);
+      fz_point z = fz_make_point(b.x0 + cmd.select.x1 / s, b.y0 + cmd.select.y1 / s);
+      fz_stext_page *page = NULL;
+      char *text = NULL;
+      fz_var(page);
+      fz_var(text);
+      fz_try(ctx)
+      {
+        page = fz_new_stext_page_from_display_list(ctx, ui->export_dl, NULL);
+        ui->sel_count = fz_highlight_selection(ctx, page, a, z, ui->sel_quads,
+                                               nelem(ui->sel_quads));
+        ui->sel_page = ui->page;
+        text = fz_copy_selection(ctx, page, a, z, 0);
+        editor_selected_text(text);
+        fprintf(stderr, "[command] select: %d quads, %d bytes\n",
+                ui->sel_count, (int)strlen(text));
+        export_page(ps, ui, ui->export_dl);
+      }
+      fz_always(ctx)
+      {
+        fz_free(ctx, text);
+        fz_drop_stext_page(ctx, page);
+      }
+      fz_catch(ctx)
+      {
+        fprintf(stderr, "[command] select: %s\n", fz_caught_message(ctx));
+      }
+    }
+    break;
+
+    case EDIT_CLICK_AT:
+    {
+      if (!ui->export_valid)
+        break;
+      if (ui->sel_count > 0)
+      {
+        ui->sel_count = 0;
+        if (ui->export_dl)
+          export_page(ps, ui, ui->export_dl);
+      }
+      fz_buffer *buf;
+      synctex_t *stx = send(synctex, ui->eng, &buf);
+      if (stx && buf)
+      {
+        fz_point pt = fz_make_point(
+            ui->export_bounds.x0 + cmd.click_at.x / ui->export_scale,
+            ui->export_bounds.y0 + cmd.click_at.y / ui->export_scale);
+        float f = 1 / send(scale_factor, ui->eng);
+        fprintf(stderr, "[command] click-at (%f,%f) mapped:(%f,%f)\n",
+                cmd.click_at.x, cmd.click_at.y, f * pt.x, f * pt.y);
+        synctex_scan(ps->ctx, stx, buf, ps->doc_path, ui->page, f * pt.x, f * pt.y);
+      }
+    }
+    break;
   }
 }
 
@@ -1179,6 +1411,12 @@ bool texpresso_main(struct persistent_state *ps)
   ui_state raw_ui, *ui = &raw_ui;
 
   ui->window = ps->window;
+  ui->export_path = NULL;
+  ui->export_width = ui->export_height = 0;
+  ui->export_valid = false;
+  ui->export_dl = NULL;
+  ui->sel_count = 0;
+  ui->sel_page = -1;
 
   bool using_texlive = 0;
 

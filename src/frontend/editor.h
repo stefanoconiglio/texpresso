@@ -37,6 +37,9 @@ enum EDITOR_COMMAND
   EDIT_RESUME,
   EDIT_RERUN,
   EDIT_RERUN_ONCE,
+  EDIT_RENDER_TO,
+  EDIT_CLICK_AT,
+  EDIT_SELECT,
 };
 
 struct editor_change
@@ -136,6 +139,26 @@ struct editor_command
 
     struct {
     } rerun_once;
+
+    // Write the displayed page as a PNG at `path`, fitted to width x height
+    // pixels, after every change; an empty path or a zero size stops it.
+    struct {
+      const char *path;
+      int width, height;
+    } render_to;
+
+    // A click at (x, y), in pixels of the last image written by render-to:
+    // answered with a synctex message, as a click in the window is.
+    struct {
+      float x, y;
+    } click_at;
+
+    // Select the text from (x0, y0) to (x1, y1), in pixels of the last image
+    // written by render-to, in reading order: answered with selected-text,
+    // and the image is written again with the selection highlighted.
+    struct {
+      float x0, y0, x1, y1;
+    } select;
   };
 };
 
@@ -158,6 +181,8 @@ void editor_flush(void);
 void editor_synctex(const char *dirname, const char *basename, int basename_len, int line, int column);
 void editor_reset_sync(void);
 void editor_notify_file_opened(int index, const char *path, int len);
+void editor_page_image(const char *path, int page, int page_count, int width, int height);
+void editor_selected_text(const char *text);
 
 enum EDITOR_LOOKUP_STATUS
 {
