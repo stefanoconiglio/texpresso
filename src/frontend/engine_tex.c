@@ -471,6 +471,53 @@ lookup_path(struct tex_engine *self, const char *path, char buf[1024], struct st
   return fs_path;
 }
 
+// The extension the engine adds to a name of this kind when the driver
+// answers that the file is missing (format_extensions in
+// src/engine/main/formats.c).
+static const char *kind_extension(enum txp_file_kind kind)
+{
+  switch (kind)
+  {
+    case TXP_KIND_ENC:       return ".enc";
+    case TXP_KIND_FONT_MAP:  return ".map";
+    case TXP_KIND_TFM:       return ".tfm";
+    case TXP_KIND_VF:        return ".vf";
+    case TXP_KIND_TRUE_TYPE: return ".ttf";
+    case TXP_KIND_TYPE1:     return ".pfb";
+    case TXP_KIND_OPEN_TYPE: return ".otf";
+    case TXP_KIND_TEX:       return ".tex";
+    default:                 return NULL;
+  }
+}
+
+// TeX names files without their extension (\input{child}). When the driver
+// answers that "child" is missing, the engine opens "child.tex" from disk
+// by itself, behind the driver's back: the editor's copy is not served, and
+// the reads are not traced, so later changes do not roll back. LaTeX even
+// takes that path whenever the editor's copy differs in length from the
+// disk's: \input compares \filesize{child} (the disk's, through the engine)
+// with \filesize{child.tex} (the editor's, through the driver) and reads
+// the bare name when they differ. So the driver adds the extension first,
+// and serves the file under that name, the editor's copy first.
+// Returns the name with its extension in buffer, or NULL.
+static const char *
+lookup_with_extension(struct tex_engine *self, const char *path,
+                      enum txp_file_kind kind, char buffer[1024],
+                      char fs_path_buffer[1024], const char **fs_path)
+{
+  const char *ext = kind_extension(kind);
+  if (!ext || snprintf(buffer, 1024, "%s%s", path, ext) >= 1024)
+    return NULL;
+  fileentry_t *e = filesystem_lookup(self->fs, buffer);
+  if (e && entry_data(e))
+  {
+    *fs_path = NULL;
+    return buffer;
+  }
+  *fs_path = lookup_path(self, buffer, fs_path_buffer, NULL);
+  return *fs_path ? buffer : NULL;
+}
+
 static bool need_snapshot(fz_context *ctx, struct tex_engine *self, int time)
 {
   // Fences are pending: don't snapshot now
@@ -537,6 +584,11 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
       char fs_path_buffer[1024];
       const char *fs_path = NULL;
 
+      // The name the file is opened under: TeX's, or TeX's with the
+      // extension the engine would add (lookup_with_extension).
+      char ext_path_buffer[1024];
+      const char *path = q->open.path;
+
       if (q->tag == Q_OPRD)
       {
         e = filesystem_lookup(self->fs, q->open.path);
@@ -549,6 +601,7 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
           fs_path = lookup_path(self, q->open.path, fs_path_buffer, NULL);
           if (!fs_path)
           {
+            const char *full = NULL;
             e = filesystem_lookup_or_create(ctx, self->fs, q->open.path);
             if (e->promised && !self->deferred.active)
             {
@@ -563,6 +616,17 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
               editor_notify_lookup(q->open.path, strlen(q->open.path), true,
                                    LOOKUP_PROMISED);
             }
+            else if ((full = lookup_with_extension(self, q->open.path,
+                                                   q->open.kind, ext_path_buffer,
+                                                   fs_path_buffer, &fs_path)))
+            {
+              // Found with its extension: record that the bare name is
+              // missing, as below, and open the file under its full name.
+              log_fileentry(ctx, self->log, e);
+              record_seen(self, e, INT_MAX, q->time);
+              path = full;
+              e = filesystem_lookup(self->fs, path);
+            }
             else
             {
               // File is missing: record this observation and mark the lookup
@@ -574,13 +638,14 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
                                    LOOKUP_FAILED);
               channel_write_answer(self->c, p->fd, &a);
             }
-            break;
+            if (!full)
+              break;
           }
         }
       }
 
       if (!e)
-        e = filesystem_lookup_or_create(ctx, self->fs, q->open.path);
+        e = filesystem_lookup_or_create(ctx, self->fs, path);
 
       log_filecell(ctx, self->log, cell);
       log_fileentry(ctx, self->log, e);
@@ -596,7 +661,7 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
         if (e->saved.level < FILE_READ)
         {
           if (!fs_path && !(self->stream_mode && e->edit_data))
-            fs_path = lookup_path(self, q->open.path, fs_path_buffer, NULL);
+            fs_path = lookup_path(self, path, fs_path_buffer, NULL);
           if (!fs_path)
           {
             if (!e->edit_data)
@@ -606,19 +671,19 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
                 log_fileentry(ctx, self->log, e);
                 record_seen(self, e, INT_MAX, q->time);
                 a.tag = A_PASS;
-                editor_notify_lookup(q->open.path, strlen(q->open.path),
+                editor_notify_lookup(path, strlen(path),
                                      q->tag == Q_OPRD, LOOKUP_FAILED);
                 channel_write_answer(self->c, p->fd, &a);
                 break;
               }
-              mabort("path: %s\nmode:%c\n", q->open.path, (q->tag == Q_OPRD) ? 'r' : 'w');
+              mabort("path: %s\nmode:%c\n", path, (q->tag == Q_OPRD) ? 'r' : 'w');
             }
             e->saved.level = FILE_READ;
             memset(&e->fs_stat, 0, sizeof(e->fs_stat));
           }
           else
           {
-            if (fs_path == q->open.path)
+            if (fs_path == path)
               fs_path = e->path;
             e->fs_data = fz_read_file(ctx, fs_path);
             e->saved.level = FILE_READ;
@@ -696,11 +761,11 @@ static void answer_query(fz_context *ctx, struct tex_engine *self, query_t *q)
         }
       }
 
-      int n = strlen(q->open.path);
+      int n = strlen(path);
       a.open.path_len = n;
       a.tag = A_OPEN;
-      editor_notify_lookup(q->open.path, n, q->tag == Q_OPRD, LOOKUP_SUCCESSFUL);
-      memmove(channel_get_buffer(self->c, n), q->open.path, n);
+      editor_notify_lookup(path, n, q->tag == Q_OPRD, LOOKUP_SUCCESSFUL);
+      memmove(channel_get_buffer(self->c, n), path, n);
       channel_write_answer(self->c, p->fd, &a);
       break;
     }
