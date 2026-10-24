@@ -321,6 +321,81 @@ void dvi_exec_xdvfontdef(fz_context *ctx, dvi_context *dc, dvi_state *st, uint32
   }
 }
 
+// Glyph to Unicode for XeTeX's native fonts. XeTeX writes glyph numbers
+// only (characters too only under \XeTeXgenerateactualtext), so, as
+// xdvipdfmx does for a PDF's ToUnicode, the text comes back from the font's
+// own cmap read in reverse: built once per font, for the scripts and symbols
+// slides use, kept for the last 64 fonts.
+typedef struct
+{
+  fz_font *font;
+  int *map, len;
+} xdv_unicode_map;
+
+static xdv_unicode_map xdv_umaps[64];
+static int xdv_umap_next;
+
+static const struct { int lo, hi; } xdv_ranges[] = {
+  {0x0020, 0x024F},  // Latin
+  {0x0370, 0x03FF},  // Greek
+  {0x0400, 0x04FF},  // Cyrillic
+  {0x1E00, 0x1EFF},  // Latin extended additional
+  {0x2000, 0x206F},  // punctuation: dashes, quotes, ellipsis
+  {0x20A0, 0x20CF},  // currency
+  {0x2100, 0x214F},  // letterlike symbols
+  {0x2190, 0x22FF},  // arrows, mathematical operators
+  {0x2300, 0x23FF},  // technical
+  {0x25A0, 0x25FF},  // geometric shapes (bullets)
+  {0xFB00, 0xFB04},  // ligatures ff fi fl ffi ffl, spelt out below
+};
+
+static const char *xdv_ligatures[] = {"ff", "fi", "fl", "ffi", "ffl"};
+
+static xdv_unicode_map *xdv_unicode_map_get(fz_context *ctx, fz_font *font)
+{
+  for (int i = 0; i < 64; ++i)
+    if (xdv_umaps[i].font == font)
+      return &xdv_umaps[i];
+
+  int max = -1;
+  for (int r = 0; r < (int)nelem(xdv_ranges); ++r)
+    for (int u = xdv_ranges[r].lo; u <= xdv_ranges[r].hi; ++u)
+      max = fz_maxi(max, fz_encode_character(ctx, font, u));
+
+  int len = max + 1;
+  int *map = fz_malloc(ctx, fz_maxi(len, 1) * sizeof(int));
+  memset(map, 0, fz_maxi(len, 1) * sizeof(int));
+  for (int r = 0; r < (int)nelem(xdv_ranges); ++r)
+    for (int u = xdv_ranges[r].lo; u <= xdv_ranges[r].hi; ++u)
+    {
+      int g = fz_encode_character(ctx, font, u);
+      if (g > 0 && g < len && map[g] == 0)
+        map[g] = u;
+    }
+
+  xdv_unicode_map *m = &xdv_umaps[xdv_umap_next];
+  xdv_umap_next = (xdv_umap_next + 1) % 64;
+  if (m->font)
+  {
+    fz_drop_font(ctx, m->font);
+    fz_free(ctx, m->map);
+  }
+  m->font = fz_keep_font(ctx, font);
+  m->map = map;
+  m->len = len;
+  return m;
+}
+
+// The next character of a UTF-16 run, joining a surrogate pair.
+static int xdv_next_char(const uint16_t *chars, int count, int *i)
+{
+  int c = chars[(*i)++];
+  if (c >= 0xD800 && c < 0xDC00 && *i < count &&
+      chars[*i] >= 0xDC00 && chars[*i] < 0xE000)
+    c = 0x10000 + ((c - 0xD800) << 10) + (chars[(*i)++] - 0xDC00);
+  return c;
+}
+
 void dvi_exec_xdvglyphs(fz_context *ctx, dvi_context *dc, dvi_state *st, fixed_t width,
                 int char_count, uint16_t *chars,
                 int num_glyphs, fixed_t *dx, fixed_t dy0, fixed_t *dy, uint16_t *glyphs)
@@ -345,15 +420,39 @@ void dvi_exec_xdvglyphs(fz_context *ctx, dvi_context *dc, dvi_state *st, fixed_t
     if (dc->dev)
     {
       fz_text *text = get_text(ctx, dc);
+      // Give the glyphs their characters, so that text taken from the page
+      // (a selection) reads right: the run's own (UTF-16) when the XDV has
+      // them, glyph i taking character i and a ligature's spare characters
+      // following the last glyph (XeTeX gives no cluster map); else the
+      // font's cmap read in reverse, ligatures spelt out.
+      xdv_unicode_map *rev = char_count == 0 ? xdv_unicode_map_get(ctx, font) : NULL;
+      int ci = 0;
+      fz_matrix ctm = st->gs.ctm;
       for (int i = 0; i < num_glyphs; ++i)
       {
         int32_t h = sh + dx[i].value;
         int32_t v = dy ? sv + dy[i].value : sv;
-        fz_matrix ctm =
-            fz_pre_scale(fz_pre_translate(st->gs.ctm, h * ds, -v * ds), fs, fs);
-        fz_show_glyph(ctx, text, font, ctm, glyphs[i], 0, 0, 0, FZ_BIDI_LTR,
+        ctm = fz_pre_scale(fz_pre_translate(st->gs.ctm, h * ds, -v * ds), fs, fs);
+        int u = 0;
+        const char *more = NULL;
+        if (ci < char_count)
+          u = xdv_next_char(chars, char_count, &ci);
+        else if (rev && glyphs[i] < rev->len)
+          u = rev->map[glyphs[i]];
+        if (u >= 0xFB00 && u <= 0xFB04)
+        {
+          more = xdv_ligatures[u - 0xFB00];
+          u = *more++;
+        }
+        fz_show_glyph(ctx, text, font, ctm, glyphs[i], u, 0, 0, FZ_BIDI_LTR,
                       FZ_LANG_UNSET);
+        while (more && *more)
+          fz_show_glyph(ctx, text, font, ctm, -1, *more++, 0, 0, FZ_BIDI_LTR,
+                        FZ_LANG_UNSET);
       }
+      while (num_glyphs > 0 && ci < char_count)
+        fz_show_glyph(ctx, text, font, ctm, -1, xdv_next_char(chars, char_count, &ci),
+                      0, 0, FZ_BIDI_LTR, FZ_LANG_UNSET);
     }
   }
   else
