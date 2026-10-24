@@ -675,7 +675,8 @@ void editor_notify_file_opened(int index, const char *path, int len)
   }
 }
 
-void editor_page_image(const char *path, int page, int page_count, int width, int height)
+void editor_page_image(const char *path, int page, int page_count, int width, int height,
+                       const char *dirname, const char *source, int source_len, int line)
 {
   switch (protocol)
   {
@@ -686,12 +687,26 @@ void editor_page_image(const char *path, int page, int page_count, int width, in
   switch (protocol)
   {
     case EDITOR_SEXP:
-      fprintf(stdout, "\" %d %d %d %d)\n", page, page_count, width, height);
+      fprintf(stdout, "\" %d %d %d %d ", page, page_count, width, height);
       break;
     case EDITOR_JSON:
-      fprintf(stdout, "\", %d, %d, %d, %d]\n", page, page_count, width, height);
+      fprintf(stdout, "\", %d, %d, %d, %d, ", page, page_count, width, height);
       break;
   }
+  // The source the page starts at, as a synctex message names it, or none
+  if (source && source_len > 0)
+  {
+    fprintf(stdout, "\"");
+    if (source[0] != '/')
+    {
+      output_data_string(stdout, dirname, strlen(dirname));
+      output_data_string(stdout, "/", 1);
+    }
+    output_data_string(stdout, source, source_len);
+    fprintf(stdout, protocol == EDITOR_SEXP ? "\" %d)\n" : "\", %d]\n", line);
+  }
+  else
+    fprintf(stdout, protocol == EDITOR_SEXP ? "nil 0)\n" : "null, 0]\n");
 }
 
 void editor_selected_text(const char *text)

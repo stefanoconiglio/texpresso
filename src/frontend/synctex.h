@@ -40,6 +40,9 @@ void synctex_page_offset(fz_context *ctx, synctex_t *stx, unsigned index, int *b
 int synctex_input_offset(fz_context *ctx, synctex_t *stx, unsigned index);
 void synctex_scan(fz_context *ctx, synctex_t *stx, fz_buffer *buf, const char *doc_dir, unsigned page, int x, int y);
 
+int synctex_page_source(fz_context *ctx, synctex_t *stx, fz_buffer *buf,
+                        unsigned page, const char **name, int *len, int *line);
+
 int synctex_has_target(synctex_t *stx);
 void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line);
 int synctex_find_target(fz_context *ctx, synctex_t *stx, fz_buffer *buf, int *page, int *x, int *y);

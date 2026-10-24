@@ -1051,7 +1051,14 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
       fz_drop_display_list(ctx, ui->export_dl);
       ui->export_dl = fz_keep_display_list(ctx, dl);
     }
-    editor_page_image(ui->export_path, ui->page, send(page_count, ui->eng), pw, ph);
+    const char *src = NULL;
+    int src_len = 0, src_line = 0;
+    fz_buffer *sbuf = NULL;
+    synctex_t *stx = send(synctex, ui->eng, &sbuf);
+    if (!synctex_page_source(ctx, stx, sbuf, ui->page, &src, &src_len, &src_line))
+      src = NULL;
+    editor_page_image(ui->export_path, ui->page, send(page_count, ui->eng), pw, ph,
+                      ps->doc_path, src, src_len, src_line);
     fflush(stdout);
   }
   fz_always(ctx)

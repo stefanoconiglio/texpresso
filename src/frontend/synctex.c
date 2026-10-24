@@ -710,6 +710,73 @@ void synctex_scan(fz_context *ctx,
   }
 }
 
+static bool is_oneliner(enum kind k)
+{
+  return (k >= STEX_CURRENT && k <= STEX_MATH);
+}
+
+// The source a page starts at, for an editor that follows the pages with its
+// source: the first record of the page that points into one of the
+// document's own files (an input named relative to the document, not a
+// package of the distribution), past the page's outer box, whose location is
+// where the page was shipped out.  A page with no such record (a beamer frame,
+// typeset whole when its \end{frame} is read) gives that shipout location.
+static int own_input(fz_buffer *buf, synctex_t *stx, int tag,
+                     const char **name, int *len)
+{
+  if (tag <= 0 || tag > stx->input_off.len)
+    return 0;
+  const char *fname;
+  int flen = get_input(buf, stx, tag - 1, &fname);
+  if (flen <= 0 || fname[0] == '/')
+    return 0;
+  *name = fname;
+  *len = flen;
+  return 1;
+}
+
+int synctex_page_source(fz_context *ctx, synctex_t *stx, fz_buffer *buf,
+                        unsigned page, const char **name, int *len, int *line)
+{
+  if (!stx || !buf || synctex_page_count(stx) <= page)
+    return 0;
+
+  int bop, eop;
+  synctex_page_offset(ctx, stx, page, &bop, &eop);
+  const uint8_t *ptr = &buf->data[bop];
+
+  struct record r = {0,}, r0 = {0,};
+  int have_r0 = 0;
+  while ((ptr = parse_line(ptr, &r)))
+  {
+    if (!have_r0)
+    {
+      if (r.kind == STEX_ENTER_H || r.kind == STEX_ENTER_V)
+      {
+        r0 = r;
+        have_r0 = 1;
+      }
+      continue;
+    }
+    if (!is_oneliner(r.kind) && r.kind != STEX_ENTER_H && r.kind != STEX_ENTER_V)
+      continue;
+    if (r.link.tag == r0.link.tag && r.link.line == r0.link.line)
+      continue;
+    if (own_input(buf, stx, r.link.tag, name, len))
+    {
+      *line = r.link.line;
+      return 1;
+    }
+  }
+
+  if (have_r0 && own_input(buf, stx, r0.link.tag, name, len))
+  {
+    *line = r0.link.line;
+    return 1;
+  }
+  return 0;
+}
+
 void synctex_set_target(synctex_t *stx, int current_page, const char *path, int line)
 {
   if (!stx)
@@ -735,11 +802,6 @@ void synctex_set_target(synctex_t *stx, int current_page, const char *path, int 
 
   stx->input_tag = 0;
   stx->input_found = 0;
-}
-
-static bool is_oneliner(enum kind k)
-{
-  return (k >= STEX_CURRENT && k <= STEX_MATH);
 }
 
 static bool synctex_find_input(fz_context *ctx, synctex_t *stx, fz_buffer *buf)
