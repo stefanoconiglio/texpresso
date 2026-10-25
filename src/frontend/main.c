@@ -925,7 +925,7 @@ static uint32_t convert_color(fz_context *ctx, vstack *stack, float frgb[3])
   uint8_t rgb[3];
 
   for (int i = 0; i < 3; ++i)
-    rgb[i] = fz_clampi(frgb[i] * 255.0, 0, 255) & 0xFF;
+    rgb[i] = fz_clampi(frgb[i] * 255.0 + 0.5, 0, 255) & 0xFF;
 
   return (rgb[0] << 16) | (rgb[1] << 8) | (rgb[2]);
 }
@@ -1342,6 +1342,10 @@ static void interpret_command(struct persistent_state *ps,
       schedule_event(RENDER_EVENT);
       fprintf(stderr, "[command] theme %x %x\n",
               config->background_color, config->foreground_color);
+      // The editor shows the page written by render-to: write it again in
+      // the new colours (the window above repaints by itself).
+      if (ui->export_path && ui->export_dl)
+        export_page(ps, ui, ui->export_dl);
     }
     break;
 
