@@ -123,6 +123,7 @@ typedef struct {
   bool export_valid;
   float export_scale;
   fz_rect export_bounds;
+  fz_point export_origin;       // the page's top left corner in the image
   fz_display_list *export_dl;   // the page of the last image, for select
   // The selection highlighted in the image (select), on page sel_page
   fz_quad sel_quads[512];
@@ -1168,7 +1169,9 @@ static void save_pixmap_as_sixel(fz_context *ctx, fz_pixmap *pix, const char *pa
 // Write the displayed page as a PNG (a Sixel picture when the path ends in
 // ".six") fitted to the box asked for by render-to, through a temporary
 // file renamed in place (a reader never sees half an image), then tell the
-// editor.
+// editor.  A Sixel picture is the whole box, the page centred on paper: a
+// terminal keeps what a picture does not cover, so each one covers what the
+// last one did.
 static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_list *dl)
 {
   if (!ui->export_path || ui->export_width <= 0 || ui->export_height <= 0)
@@ -1183,6 +1186,8 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
   fz_var(tmp);
   fz_try(ctx)
   {
+    size_t len = strlen(ui->export_path);
+    bool sixel = len > 4 && strcmp(ui->export_path + len - 4, ".six") == 0;
     fz_rect b = fz_bound_display_list(ctx, dl);
     float bw = b.x1 - b.x0, bh = b.y1 - b.y0;
     if (bw <= 0 || bh <= 0)
@@ -1190,10 +1195,16 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
     float scale = fz_min(ui->export_width / bw, ui->export_height / bh);
     int pw = fz_maxi(1, (int)(bw * scale + 0.5f));
     int ph = fz_maxi(1, (int)(bh * scale + 0.5f));
+    int iw = sixel ? fz_maxi(pw, ui->export_width) : pw;
+    int ih = sixel ? fz_maxi(ph, ui->export_height) : ph;
+    int ox = (iw - pw) / 2, oy = (ih - ph) / 2;
 
-    pix = fz_new_pixmap(ctx, fz_device_rgb(ctx), pw, ph, NULL, 0);
+    // Cleared to white, the paper: export_recolor gives it the theme's
+    // background, inside the page and around it alike.
+    pix = fz_new_pixmap(ctx, fz_device_rgb(ctx), iw, ih, NULL, 0);
     fz_clear_pixmap_with_value(ctx, pix, 255);
-    fz_matrix ctm = fz_pre_translate(fz_scale(scale, scale), -b.x0, -b.y0);
+    fz_matrix ctm = fz_concat(fz_pre_translate(fz_scale(scale, scale), -b.x0, -b.y0),
+                              fz_translate(ox, oy));
     dev = fz_new_draw_device(ctx, ctm, pix);
     fz_run_display_list(ctx, dl, dev, fz_identity, fz_infinite_rect, NULL);
     fz_close_device(ctx, dev);
@@ -1205,11 +1216,10 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
     if (ui->sel_count > 0)
       export_highlight(ctx, ui, pix, ctm);
 
-    size_t n = strlen(ui->export_path) + 5;
+    size_t n = len + 5;
     tmp = fz_malloc(ctx, n);
     snprintf(tmp, n, "%s.tmp", ui->export_path);
-    size_t len = strlen(ui->export_path);
-    if (len > 4 && strcmp(ui->export_path + len - 4, ".six") == 0)
+    if (sixel)
       save_pixmap_as_sixel(ctx, pix, tmp);
     else
       fz_save_pixmap_as_png(ctx, pix, tmp);
@@ -1219,6 +1229,7 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
     ui->export_valid = true;
     ui->export_scale = scale;
     ui->export_bounds = b;
+    ui->export_origin = fz_make_point(ox, oy);
     if (ui->export_dl != dl)
     {
       fz_drop_display_list(ctx, ui->export_dl);
@@ -1230,7 +1241,7 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
     synctex_t *stx = send(synctex, ui->eng, &sbuf);
     if (!synctex_page_source(ctx, stx, sbuf, ui->page, &src, &src_len, &src_line))
       src = NULL;
-    editor_page_image(ui->export_path, ui->page, send(page_count, ui->eng), pw, ph,
+    editor_page_image(ui->export_path, ui->page, send(page_count, ui->eng), iw, ih,
                       ps->doc_path, src, src_len, src_line);
     fflush(stdout);
   }
@@ -1496,8 +1507,11 @@ static void interpret_command(struct persistent_state *ps,
       fz_context *ctx = ps->ctx;
       fz_rect b = ui->export_bounds;
       float s = ui->export_scale;
-      fz_point a = fz_make_point(b.x0 + cmd.select.x0 / s, b.y0 + cmd.select.y0 / s);
-      fz_point z = fz_make_point(b.x0 + cmd.select.x1 / s, b.y0 + cmd.select.y1 / s);
+      fz_point o = ui->export_origin;
+      fz_point a = fz_make_point(b.x0 + (cmd.select.x0 - o.x) / s,
+                                 b.y0 + (cmd.select.y0 - o.y) / s);
+      fz_point z = fz_make_point(b.x0 + (cmd.select.x1 - o.x) / s,
+                                 b.y0 + (cmd.select.y1 - o.y) / s);
       fz_stext_page *page = NULL;
       char *text = NULL;
       fz_var(page);
@@ -1541,8 +1555,8 @@ static void interpret_command(struct persistent_state *ps,
       if (stx && buf)
       {
         fz_point pt = fz_make_point(
-            ui->export_bounds.x0 + cmd.click_at.x / ui->export_scale,
-            ui->export_bounds.y0 + cmd.click_at.y / ui->export_scale);
+            ui->export_bounds.x0 + (cmd.click_at.x - ui->export_origin.x) / ui->export_scale,
+            ui->export_bounds.y0 + (cmd.click_at.y - ui->export_origin.y) / ui->export_scale);
         float f = 1 / send(scale_factor, ui->eng);
         fprintf(stderr, "[command] click-at (%f,%f) mapped:(%f,%f)\n",
                 cmd.click_at.x, cmd.click_at.y, f * pt.x, f * pt.y);
