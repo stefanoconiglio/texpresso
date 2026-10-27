@@ -106,6 +106,10 @@ struct tex_engine
 
   bool aux_dirty;
   bool finishing;
+
+  // The root TeX processes replaced, not yet reaped
+  int dead_roots[8];
+  int dead_root_count;
 };
 
 // Backtrackable process state & VFS representation
@@ -205,8 +209,22 @@ static pid_t exec_xelatex(char *engine_path, bool use_texlive, const char *filen
   return pid;
 }
 
+// The root TeX process is the driver's child (the snapshots are its own
+// children): reap the ones replaced, or each relaunch leaves a zombie. By
+// pid, never waitpid(-1): the providers' popen and system wait on theirs.
+static void reap_dead_roots(struct tex_engine *self)
+{
+  int j = 0;
+  for (int i = 0; i < self->dead_root_count; i++)
+    if (waitpid(self->dead_roots[i], NULL, WNOHANG) == 0)
+      self->dead_roots[j++] = self->dead_roots[i];
+  self->dead_root_count = j;
+}
+
 static void prepare_process(fz_context *ctx, struct tex_engine *self)
 {
+  if (self->dead_root_count > 0)
+    reap_dead_roots(self);
   if (self->process_count == 0)
   {
     self->deferred.active = false;
@@ -238,6 +256,13 @@ static void pop_process(fz_context *ctx, struct tex_engine *self)
   close_process(p);
   channel_reset(self->c);
   self->process_count -= 1;
+  if (self->process_count == 0)
+  {
+    if (self->dead_root_count == 8)
+      reap_dead_roots(self);
+    if (self->dead_root_count < 8)
+      self->dead_roots[self->dead_root_count++] = p->pid;
+  }
   mark_t mark =
     self->process_count > 0 ? get_process(self)->snap : self->restart;
   log_rollback(ctx, self->log, mark);
