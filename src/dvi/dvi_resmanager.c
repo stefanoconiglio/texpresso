@@ -697,12 +697,18 @@ fz_font *dvi_resmanager_get_xdv_font(fz_context *ctx, dvi_resmanager *rm, const 
 
 void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind kind, const char *name)
 {
+  // Each loop steps to the next cell only past a cell it keeps: once a cell
+  // is dropped, *cell is already the next one.
   switch (kind)
   {
     case RES_PDF:
-      for (cell_pdf_doc **cell = &rm->first_pdf_doc; *cell; cell = &(*cell)->next)
+      for (cell_pdf_doc **cell = &rm->first_pdf_doc; *cell;)
       {
-        if (strcmp(name, (*cell)->name) != 0) continue;
+        if (strcmp(name, (*cell)->name) != 0)
+        {
+          cell = &(*cell)->next;
+          continue;
+        }
         fz_free(ctx, (void*)(*cell)->name);
         pdf_drop_document(ctx, (*cell)->doc);
         cell_pdf_doc *next = (*cell)->next;
@@ -712,9 +718,13 @@ void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind 
       break;
 
     case RES_ENC:
-      for (cell_tex_enc **cell = &rm->first_tex_enc; *cell; cell = &(*cell)->next)
+      for (cell_tex_enc **cell = &rm->first_tex_enc; *cell;)
       {
-        if (strcmp(name, (*cell)->name) != 0) continue;
+        if (strcmp(name, (*cell)->name) != 0)
+        {
+          cell = &(*cell)->next;
+          continue;
+        }
         fz_free(ctx, (void*)(*cell)->name);
         tex_enc_free(ctx, (*cell)->enc);
         cell_tex_enc *next = (*cell)->next;
@@ -729,9 +739,13 @@ void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind 
 
     case RES_TFM:
     case RES_VF:
-      for (cell_dvi_font **cell = &rm->first_dvi_font; *cell; cell = &(*cell)->next)
+      for (cell_dvi_font **cell = &rm->first_dvi_font; *cell;)
       {
-        if (strcmp(name, (*cell)->font.name) != 0) continue;
+        if (strcmp(name, (*cell)->font.name) != 0)
+        {
+          cell = &(*cell)->next;
+          continue;
+        }
         fz_free(ctx, (void*)(*cell)->font.name);
         if ((*cell)->font.tfm)
           tex_tfm_free(ctx, (*cell)->font.tfm);
@@ -744,9 +758,13 @@ void dvi_resmanager_invalidate(fz_context *ctx, dvi_resmanager *rm, dvi_reskind 
       break;
 
     case RES_FONT:
-      for (cell_fz_font **cell = &rm->first_fz_font; *cell; cell = &(*cell)->next)
+      for (cell_fz_font **cell = &rm->first_fz_font; *cell;)
       {
-        if (strcmp(name, (*cell)->name) != 0) continue;
+        if (strcmp(name, (*cell)->name) != 0)
+        {
+          cell = &(*cell)->next;
+          continue;
+        }
         fz_free(ctx, (void*)(*cell)->name);
         if ((*cell)->font)
           fz_drop_font(ctx, (*cell)->font);
