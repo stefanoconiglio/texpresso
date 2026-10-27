@@ -76,6 +76,12 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
     // In parent: send other end of new socket to driver
     send_child_fd(fd, child, time, sockets[0]);
 
+    // and keep neither end: the child must see end-of-file once the driver
+    // is gone, or a driver that dies by itself leaves the whole stack of
+    // snapshots waiting
+    PERROR(close(sockets[0]));
+    PERROR(close(sockets[1]));
+
     // Wait for process to end
     int status;
     while (waitpid(child, &status, 0) == -1)
@@ -98,12 +104,19 @@ pid_t texpresso_fork_with_channel(int fd, uint32_t time)
              answer[0] == 'F' && answer[1] == 'L' &&
              answer[2] == 'S' && answer[3] == 'H');
 
+    // The driver is gone (end-of-file, or a reset when it died with data
+    // unread): end quietly, as the child did. _exit, not exit: the stdio
+    // buffers are shared with the parent snapshot.
+    if (recvd <= 0)
+      _exit(1);
+
     PASSERT(recvd == 4 &&
             answer[0] == 'D' && answer[1] == 'O' &&
             answer[2] == 'N' && answer[3] == 'E',
             "recvd: %d, answer: %C%C%C%C",
             recvd,
             answer[0], answer[1], answer[2], answer[3]);
+    return child;
   }
   PERROR(close(sockets[0]));
 
