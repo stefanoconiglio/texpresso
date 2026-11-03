@@ -844,6 +844,23 @@ void ttstub_pic_set_cached_bounds(const char *name, int type, int page, const fl
 
 // Entry point
 
+// The format the document is written for: Texinfo's texinfo.tex is built on
+// plain TeX and fails on top of LaTeX, so a Texinfo file gets plain XeTeX's.
+static const char *document_format(const char *doc_path)
+{
+  static const char *texinfo[] = {".texi", ".texinfo", ".txi", NULL};
+  if (!doc_path)
+    return "xelatex.ini";
+  size_t len = strlen(doc_path);
+  for (const char **ext = texinfo; *ext; ext++)
+  {
+    size_t n = strlen(*ext);
+    if (len > n && strcmp(doc_path + len - n, *ext) == 0)
+      return "xetex.ini";
+  }
+  return "xelatex.ini";
+}
+
 static void usage(char *argv0)
 {
   fprintf(
@@ -857,7 +874,9 @@ static void usage(char *argv0)
       "  -tectonic    Use Tectonic packages (need tectonic command)\n"
       "  -texpresso   Internal (route I/O through TeXpresso)\n"
       "  -regenerate-format  Force generation of a fresh format file\n"
-      "Default: try TeXlive first, then Tectonic, then fails\n",
+      "Default: try TeXlive first, then Tectonic, then fails\n"
+      "A Texinfo file (.texi, .texinfo, .txi) is typeset with plain XeTeX's\n"
+      "format, which texinfo.tex is written for; any other with XeLaTeX's.\n",
       argv0);
 }
 
@@ -1045,7 +1064,7 @@ int main(int argc, char **argv)
     fprintf(stderr, "Using Tectonic.\n");
 
   // Generate format if necessary
-  format_name = "xelatex.ini";
+  format_name = document_format(doc_path);
   if (!validate_format() && !bootstrap_format())
   {
     fprintf(stderr, "Failed to generate format.\n");
