@@ -337,6 +337,23 @@ bool editor_parse(fz_context *ctx,
             .height = val_number(ctx, height),
         }};
   }
+  else if (strcmp(verb, "thumbnails") == 0)
+  {
+    if (len != 4)
+      goto arity;
+    val dir = val_array_get(ctx, stack, command, 1);
+    val width = val_array_get(ctx, stack, command, 2);
+    val height = val_array_get(ctx, stack, command, 3);
+    if (!val_is_string(dir) || !val_is_number(width) || !val_is_number(height))
+      goto arguments;
+    *out = (struct editor_command){
+        .tag = EDIT_THUMBNAILS,
+        .thumbnails = {
+            .dir = val_string(ctx, stack, dir),
+            .width = val_number(ctx, width),
+            .height = val_number(ctx, height),
+        }};
+  }
   else if (strcmp(verb, "click-at") == 0)
   {
     if (len != 3)
@@ -707,6 +724,60 @@ void editor_page_image(const char *path, int page, int page_count, int width, in
   }
   else
     fprintf(stdout, protocol == EDITOR_SEXP ? "nil 0)\n" : "null, 0]\n");
+}
+
+// The source a page starts at, as a synctex message names it, or none
+static void output_page_source(const char *dirname, const char *source, int source_len,
+                               int line)
+{
+  if (source && source_len > 0)
+  {
+    fprintf(stdout, "\"");
+    if (source[0] != '/')
+    {
+      output_data_string(stdout, dirname, strlen(dirname));
+      output_data_string(stdout, "/", 1);
+    }
+    output_data_string(stdout, source, source_len);
+    fprintf(stdout, protocol == EDITOR_SEXP ? "\" %d)\n" : "\", %d]\n", line);
+  }
+  else
+    fprintf(stdout, protocol == EDITOR_SEXP ? "nil 0)\n" : "null, 0]\n");
+}
+
+void editor_thumbnail(const char *path, int page, int width, int height,
+                      const char *dirname, const char *source, int source_len, int line)
+{
+  switch (protocol)
+  {
+    case EDITOR_SEXP: fprintf(stdout, "(thumbnail \""); break;
+    case EDITOR_JSON: fprintf(stdout, "[\"thumbnail\", \""); break;
+  }
+  output_data_string(stdout, path, strlen(path));
+  switch (protocol)
+  {
+    case EDITOR_SEXP:
+      fprintf(stdout, "\" %d %d %d ", page, width, height);
+      break;
+    case EDITOR_JSON:
+      fprintf(stdout, "\", %d, %d, %d, ", page, width, height);
+      break;
+  }
+  output_page_source(dirname, source, source_len, line);
+}
+
+void editor_thumbnails_done(int page_count, bool finished)
+{
+  switch (protocol)
+  {
+    case EDITOR_SEXP:
+      fprintf(stdout, "(thumbnails-done %d %s)\n", page_count, finished ? "t" : "nil");
+      break;
+    case EDITOR_JSON:
+      fprintf(stdout, "[\"thumbnails-done\", %d, %s]\n", page_count,
+              finished ? "true" : "false");
+      break;
+  }
 }
 
 void editor_selected_text(const char *text)

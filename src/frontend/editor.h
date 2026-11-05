@@ -40,6 +40,7 @@ enum EDITOR_COMMAND
   EDIT_RENDER_TO,
   EDIT_CLICK_AT,
   EDIT_SELECT,
+  EDIT_THUMBNAILS,
 };
 
 struct editor_change
@@ -148,6 +149,15 @@ struct editor_command
       int width, height;
     } render_to;
 
+    // Write every page typeset as a PNG in dir, page-N.png, fitted to
+    // width x height pixels, each answered with a thumbnail message, then
+    // thumbnails-done; until an empty dir, TeX goes on to the document's
+    // end, so that every page comes.
+    struct {
+      const char *dir;
+      int width, height;
+    } thumbnails;
+
     // A click at (x, y), in pixels of the last image written by render-to:
     // answered with a synctex message, as a click in the window is.
     struct {
@@ -185,6 +195,9 @@ void editor_notify_file_opened(int index, const char *path, int len);
 void editor_page_image(const char *path, int page, int page_count, int width, int height,
                        const char *dirname, const char *source, int source_len, int line);
 void editor_selected_text(const char *text);
+void editor_thumbnail(const char *path, int page, int width, int height,
+                      const char *dirname, const char *source, int source_len, int line);
+void editor_thumbnails_done(int page_count, bool finished);
 
 enum EDITOR_LOOKUP_STATUS
 {

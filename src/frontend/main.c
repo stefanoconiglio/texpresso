@@ -128,6 +128,8 @@ typedef struct {
   // The selection highlighted in the image (select), on page sel_page
   fz_quad sel_quads[512];
   int sel_count, sel_page;
+  // Thumbnails of every page (thumbnails): TeX goes on to the end meanwhile
+  bool want_all;
 } ui_state;
 
 /* UI rendering */
@@ -173,7 +175,7 @@ static bool need_advance(fz_context *ctx, ui_state *ui)
   if (send(is_finishing, ui->eng))
     return true;
 
-  int need = send(page_count, ui->eng) <= ui->page;
+  int need = ui->want_all || send(page_count, ui->eng) <= ui->page;
 
   if (!need)
   {
@@ -1257,6 +1259,67 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
   }
 }
 
+// Write each page typeset as dir/page-N.png, fitted to width x height and
+// in the theme's colours, and tell the editor of each and of the count.
+static void export_thumbnails(struct persistent_state *ps, ui_state *ui,
+                              const char *dir, int width, int height)
+{
+  fz_context *ctx = ps->ctx;
+  int count = send(page_count, ui->eng);
+  fz_buffer *sbuf = NULL;
+  synctex_t *stx = send(synctex, ui->eng, &sbuf);
+  for (int page = 0; page < count; ++page)
+  {
+    fz_display_list *dl = NULL;
+    fz_pixmap *pix = NULL;
+    fz_device *dev = NULL;
+    char path[1024], tmp[1040];
+    snprintf(path, sizeof(path), "%s/page-%d.png", dir, page);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    fz_var(dl);
+    fz_var(pix);
+    fz_var(dev);
+    fz_try(ctx)
+    {
+      dl = send(render_page, ui->eng, ctx, page);
+      fz_rect b = fz_bound_display_list(ctx, dl);
+      float bw = b.x1 - b.x0, bh = b.y1 - b.y0;
+      if (bw <= 0 || bh <= 0)
+        fz_throw(ctx, FZ_ERROR_GENERIC, "empty page");
+      float scale = fz_min(width / bw, height / bh);
+      int pw = fz_maxi(1, (int)(bw * scale + 0.5f));
+      int ph = fz_maxi(1, (int)(bh * scale + 0.5f));
+      pix = fz_new_pixmap(ctx, fz_device_rgb(ctx), pw, ph, NULL, 0);
+      fz_clear_pixmap_with_value(ctx, pix, 255);
+      fz_matrix ctm = fz_pre_translate(fz_scale(scale, scale), -b.x0, -b.y0);
+      dev = fz_new_draw_device(ctx, ctm, pix);
+      fz_run_display_list(ctx, dl, dev, fz_identity, fz_infinite_rect, NULL);
+      fz_close_device(ctx, dev);
+      export_recolor(ctx, ui, pix);
+      fz_save_pixmap_as_png(ctx, pix, tmp);
+      if (rename(tmp, path) != 0)
+        fz_throw(ctx, FZ_ERROR_GENERIC, "cannot rename %s: %s", tmp, strerror(errno));
+      const char *src = NULL;
+      int src_len = 0, src_line = 0;
+      if (!synctex_page_source(ctx, stx, sbuf, page, &src, &src_len, &src_line))
+        src = NULL;
+      editor_thumbnail(path, page, pw, ph, ps->doc_path, src, src_len, src_line);
+    }
+    fz_always(ctx)
+    {
+      fz_drop_device(ctx, dev);
+      fz_drop_pixmap(ctx, pix);
+      fz_drop_display_list(ctx, dl);
+    }
+    fz_catch(ctx)
+    {
+      fprintf(stderr, "[thumbnails] page %d: %s\n", page, fz_caught_message(ctx));
+    }
+  }
+  editor_thumbnails_done(count, send(get_status, ui->eng) != DOC_RUNNING);
+  fflush(stdout);
+}
+
 static void display_page(struct persistent_state *ps, ui_state *ui)
 {
   fz_display_list *dl = send(render_page, ui->eng, ps->ctx, ui->page);
@@ -1497,6 +1560,18 @@ static void interpret_command(struct persistent_state *ps,
       fprintf(stderr, "[command] render-to %s %dx%d\n",
               ui->export_path ? ui->export_path : "(off)",
               ui->export_width, ui->export_height);
+    }
+    break;
+
+    case EDIT_THUMBNAILS:
+    {
+      ui->want_all = cmd.thumbnails.dir[0] != 0;
+      if (ui->want_all && cmd.thumbnails.width > 0 && cmd.thumbnails.height > 0)
+        export_thumbnails(ps, ui, cmd.thumbnails.dir,
+                          cmd.thumbnails.width, cmd.thumbnails.height);
+      fprintf(stderr, "[command] thumbnails %s %dx%d\n",
+              ui->want_all ? cmd.thumbnails.dir : "(off)",
+              cmd.thumbnails.width, cmd.thumbnails.height);
     }
     break;
 
