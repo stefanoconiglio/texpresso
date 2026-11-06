@@ -465,8 +465,10 @@ size_t ttstub_input_seek(ttbc_input_handle_t *handle,
   if (texpresso)
   {
     txp_input *input = input_as_txp(handle);
+    // A file from the TeX tree: the new position, as below, not fseek's 0
+    // (dpx's PDF parser reads it as the position)
     if (input->id == -1)
-      return fseek(input->file, offset, whence);
+      return fseek(input->file, offset, whence) == 0 ? ftell(input->file) : -1;
 
     int ofs = offset;
     if (whence == SEEK_CUR)

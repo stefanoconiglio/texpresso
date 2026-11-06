@@ -136,6 +136,15 @@ tectonic_hooks_open_file(fz_context *ctx, void *env, dvi_reskind kind, const cha
         else
           memcpy(path + root_len, name, name_len);
         path[len] = 0;
+
+        // Not beside the document: a picture TeX found in the TeX tree
+        const char *tree_path;
+        if (access(path, R_OK) != 0 && (tree_path = tectonic_get_file_path(name)))
+        {
+          free(path);
+          free_path = 0;
+          path = (char*)tree_path;
+        }
       }
       break;
 
@@ -278,6 +287,15 @@ texlive_hooks_open_file(fz_context *ctx, void *env, dvi_reskind kind, const char
         else
           memcpy(path + root_len, name, name_len);
         path[len] = 0;
+
+        // Not beside the document: a picture TeX found in the TeX tree
+        const char *tree_path;
+        if (access(path, R_OK) != 0 && (tree_path = texlive_file_path(name, NULL)))
+        {
+          free(path);
+          free_path = 0;
+          path = (char*)tree_path;
+        }
       }
       break;
 
@@ -834,6 +852,8 @@ fz_image *dvi_resmanager_get_img(fz_context *ctx, dvi_resmanager *rm, const char
 
   fz_ptr(cell_image, cell);
   fz_ptr(char, pname);
+  fz_ptr(fz_stream, stm);
+  fz_ptr(fz_buffer, buf);
 
   fz_try(ctx)
   {
@@ -841,7 +861,17 @@ fz_image *dvi_resmanager_get_img(fz_context *ctx, dvi_resmanager *rm, const char
     pname = fz_strdup(ctx, filename);
     cell->name = pname;
     cell->next = rm->first_image;
-    cell->img = fz_new_image_from_file(ctx, filename);
+    // Found as a PDF is: beside the document, else in the TeX tree
+    stm = dvi_resmanager_open_file(ctx, rm, RES_PDF, pname);
+    if (!stm)
+      fz_throw(ctx, FZ_ERROR_GENERIC, "cannot open %s", pname);
+    buf = fz_read_all(ctx, stm, 0);
+    cell->img = fz_new_image_from_buffer(ctx, buf);
+  }
+  fz_always(ctx)
+  {
+    fz_drop_buffer(ctx, buf);
+    fz_drop_stream(ctx, stm);
   }
   fz_catch(ctx)
   {
