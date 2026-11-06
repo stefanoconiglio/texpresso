@@ -472,6 +472,15 @@ embed_pdf(fz_context *ctx, dvi_context *dc, dvi_state *st, struct xform_spec *xf
   return 1;
 }
 
+// Whether BB, a pdf:image bbox, is the whole picture: graphicx's bbox of a
+// picture it does not cut, at the origin and in the proportions of its pixels.
+static bool whole_picture(fz_rect bb, fz_image *img)
+{
+  float bw = bb.x1 - bb.x0, bh = bb.y1 - bb.y0;
+  return fabsf(bb.x0) < 0.01f && fabsf(bb.y0) < 0.01f &&
+         fabsf(bw * img->h - bh * img->w) < 0.005f * bw * img->h;
+}
+
 static bool
 embed_image(fz_context *ctx, dvi_context *dc, dvi_state *st, struct xform_spec *xf, const char *filename)
 {
@@ -491,7 +500,9 @@ embed_image(fz_context *ctx, dvi_context *dc, dvi_state *st, struct xform_spec *
     float ar = (float)img->w / (float)img->h;
     float w = xf->width, h = xf->height;
     fz_rect bb = xf->bbox;
-    if (!fz_is_infinite_rect(bb) && bb.x1 > bb.x0 && bb.y1 > bb.y0)
+    // A picture not cut fills its box, whatever resolution it gives
+    if (!fz_is_infinite_rect(bb) && bb.x1 > bb.x0 && bb.y1 > bb.y0 &&
+        !whole_picture(bb, img))
     {
       // As dvipdfmx draws it: the bbox, in bp of the picture at its
       // resolution, fills width x height, and with clip 1 nothing of the
