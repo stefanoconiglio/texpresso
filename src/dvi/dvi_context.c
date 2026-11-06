@@ -84,6 +84,19 @@ void dvi_context_begin_frame(fz_context *ctx, dvi_context *dc, fz_device *dev)
 void dvi_context_end_frame(fz_context *ctx, dvi_context *dc)
 {
   dvi_scratch_clear(ctx, &dc->scratch);
+
+  // A clip the page opened and never closed would be left on the stack of
+  // the device the page is drawn to, which then refuses to close.
+  dvi_state *st = &dc->root;
+  if (st->gs.clip_depth > 0)
+  {
+    fprintf(stderr, "ending frame with %d clips open\n", st->gs.clip_depth);
+    if (dc->dev)
+      for (int i = 0; i < st->gs.clip_depth; ++i)
+        fz_pop_clip(ctx, dc->dev);
+    st->gs.clip_depth = 0;
+  }
+
   dvi_context_set_device(ctx, dc, NULL);
 
   if (dc->colorstack.depth > 0)

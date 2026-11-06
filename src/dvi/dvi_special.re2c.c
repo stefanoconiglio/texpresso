@@ -1135,10 +1135,65 @@ static cursor_t parse_pdf_string(char *buf, char *end, cursor_t cur, cursor_t li
   return cur;
 }
 
+// The special after the word KW and the blanks that follow it, or NULL when
+// the special does not start with that word.
+static cursor_t pdf_keyword(cursor_t cur, cursor_t lim, const char *kw)
+{
+  size_t len = strlen(kw);
+  if ((size_t)(lim - cur) < len || memcmp(cur, kw, len) != 0)
+    return NULL;
+  cur += len;
+  if (cur < lim && *cur != ' ' && *cur != '\t' && *cur != '\n' && *cur != '\r')
+    return NULL;
+  while (cur < lim && (*cur == ' ' || *cur == '\t' || *cur == '\n' || *cur == '\r'))
+    cur += 1;
+  return cur;
+}
+
+// pdf:content OPS, which dvipdfmx writes as "q 1 0 0 1 x y cm OPS Q": OPS
+// drawn at the current point, as pdf_code already draws them, between a q
+// and a Q.  OPS that open a q of their own leave it open for a later Q:
+// trimclip's XeTeX driver clips a box so ("pdf:content q", a clip path, the
+// box, then two "pdf:literal direct Q").
+static bool
+pdf_content(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, cursor_t lim)
+{
+  if (st->gs_stack.depth >= st->gs_stack.limit)
+    return 0;
+  st->gs_stack.base[st->gs_stack.depth] = st->gs;
+  st->gs_stack.depth += 1;
+
+  bool ok = pdf_code(ctx, dc, st, cur, lim);
+
+  if (st->gs_stack.depth == 0)
+    return 0;
+  st->gs_stack.depth -= 1;
+  int clip_depth0 = st->gs.clip_depth;
+  st->gs = st->gs_stack.base[st->gs_stack.depth];
+  if (dc->dev)
+    for (int i = st->gs.clip_depth; i < clip_depth0; ++i)
+      fz_pop_clip(ctx, dc->dev);
+  return ok;
+}
+
 static bool
 dvi_exec_pdf(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, cursor_t lim)
 {
   cursor_t mar, i, f0, f1, f2, f3, f4, f5, pxform = NULL, pstart, pend;
+
+  // pdf:content OPS, and pdf:literal [direct] OPS: OPS drawn as pdf:code
+  // draws them.
+  cursor_t ops;
+  if ((ops = pdf_keyword(cur, lim, "content")))
+    return pdf_content(ctx, dc, st, ops, lim);
+  if ((ops = pdf_keyword(cur, lim, "literal")))
+  {
+    cursor_t after;
+    while ((after = pdf_keyword(ops, lim, "direct")) ||
+           (after = pdf_keyword(ops, lim, "reverse")))
+      ops = after;
+    return pdf_code(ctx, dc, st, ops, lim);
+  }
 
   /*!re2c
 
