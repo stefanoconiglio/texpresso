@@ -836,6 +836,32 @@ pdf_document *dvi_resmanager_get_pdf(fz_context *ctx, dvi_resmanager *rm, const 
   return cell->doc;
 }
 
+// Whether the picture in D gives its resolution in absolute units, as XeTeX
+// reads it: a PNG's pHYs chunk in pixels per metre, a JPEG's JFIF density in
+// dpi or dpcm.
+static bool declares_resolution(const unsigned char *d, size_t len)
+{
+  static const unsigned char png[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+  if (len >= 8 && memcmp(d, png, 8) == 0)
+  {
+    size_t i = 8;
+    while (len - i >= 12 && memcmp(d + i + 4, "IDAT", 4) != 0)
+    {
+      size_t n = (size_t)d[i] << 24 | (size_t)d[i + 1] << 16 | d[i + 2] << 8 | d[i + 3];
+      if (memcmp(d + i + 4, "pHYs", 4) == 0)
+        return n == 9 && len - i >= 21 && d[i + 16] == 1;
+      if (n > len - i - 12)
+        break;
+      i += 12 + n;
+    }
+    return 0;
+  }
+  if (len >= 18 && d[0] == 0xff && d[1] == 0xd8 && d[2] == 0xff && d[3] == 0xe0 &&
+      memcmp(d + 6, "JFIF", 5) == 0)
+    return d[13] == 1 || d[13] == 2;
+  return 0;
+}
+
 fz_image *dvi_resmanager_get_img(fz_context *ctx, dvi_resmanager *rm, const char *filename)
 {
   while (filename[0] == '.' && filename[1] == '/')
@@ -867,6 +893,11 @@ fz_image *dvi_resmanager_get_img(fz_context *ctx, dvi_resmanager *rm, const char
       fz_throw(ctx, FZ_ERROR_GENERIC, "cannot open %s", pname);
     buf = fz_read_all(ctx, stm, 0);
     cell->img = fz_new_image_from_buffer(ctx, buf);
+    // A picture that gives no resolution is 96 dpi to mupdf, 72 to XeTeX,
+    // which sizes it: it is drawn at XeTeX's size.
+    if (cell->img->xres == 96 && cell->img->yres == 96 &&
+        !declares_resolution(buf->data, buf->len))
+      cell->img->xres = cell->img->yres = 72;
   }
   fz_always(ctx)
   {

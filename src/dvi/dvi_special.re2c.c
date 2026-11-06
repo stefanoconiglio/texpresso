@@ -490,6 +490,48 @@ embed_image(fz_context *ctx, dvi_context *dc, dvi_state *st, struct xform_spec *
     //
     float ar = (float)img->w / (float)img->h;
     float w = xf->width, h = xf->height;
+    fz_rect bb = xf->bbox;
+    if (!fz_is_infinite_rect(bb) && bb.x1 > bb.x0 && bb.y1 > bb.y0)
+    {
+      // As dvipdfmx draws it: the bbox, in bp of the picture at its
+      // resolution, fills width x height, and with clip 1 nothing of the
+      // picture outside it shows (\includegraphics[trim=...,clip]).
+      float bw = bb.x1 - bb.x0, bh = bb.y1 - bb.y0;
+      float nw = img->w * 72.0f / img->xres, nh = img->h * 72.0f / img->yres;
+      float iw, ih; // the whole picture, drawn
+      if (w == w && h == h)
+        iw = w * nw / bw, ih = h * nh / bh;
+      else if (w == w)
+        iw = w * nw / bw, ih = iw / ar, h = bh * ih / nh;
+      else if (h == h)
+        ih = h * nh / bh, iw = ih * ar, w = bw * iw / nw;
+      else
+        iw = nw, ih = nh, w = bw, h = bh;
+      fz_matrix pic = fz_pre_translate(ctm, -bb.x0 * iw / nw, ih - bb.y0 * ih / nh);
+      pic = fz_pre_scale(pic, iw, -ih);
+      if (!xf->clip)
+        fz_fill_image(ctx, dc->dev, img, pic, 1.0, color_params);
+      else
+      {
+        fz_path *path = fz_new_path(ctx);
+        fz_try(ctx)
+        {
+          fz_rectto(ctx, path, 0, 0, w, h);
+          fz_clip_path(ctx, dc->dev, path, 0, ctm, fz_infinite_rect);
+        }
+        fz_always(ctx)
+          fz_drop_path(ctx, path);
+        fz_catch(ctx)
+          fz_rethrow(ctx);
+        fz_try(ctx)
+          fz_fill_image(ctx, dc->dev, img, pic, 1.0, color_params);
+        fz_always(ctx)
+          fz_pop_clip(ctx, dc->dev);
+        fz_catch(ctx)
+          fz_rethrow(ctx);
+      }
+      break;
+    }
     if (w != w && h != h)
     {
       w = img->w;
@@ -601,8 +643,8 @@ parse_xform_or_dim(struct xform_spec *xf, cursor_t cur, cursor_t lim)
            ws+ @f3 float
     {
       xf->bbox.x0 = pfloat(f0, lim);
-      xf->bbox.x1 = pfloat(f1, lim);
-      xf->bbox.y0 = pfloat(f2, lim);
+      xf->bbox.y0 = pfloat(f1, lim);
+      xf->bbox.x1 = pfloat(f2, lim);
       xf->bbox.y1 = pfloat(f3, lim);
       continue;
     }
@@ -694,12 +736,17 @@ pdf_btrans(dvi_context *dc, dvi_state *st, cursor_t cur, cursor_t lim)
 }
 
 static bool
-pdf_etrans(dvi_context *dc, dvi_state *st)
+pdf_etrans(fz_context *ctx, dvi_context *dc, dvi_state *st)
 {
   if (st->gs_stack.depth == 0)
     return 0;
   st->gs_stack.depth -= 1;
+  int clip_depth0 = st->gs.clip_depth;
   st->gs = st->gs_stack.base[st->gs_stack.depth];
+  // the clips opened since btrans end with it, as with Q
+  if (dc->dev)
+    for (int i = st->gs.clip_depth; i < clip_depth0; ++i)
+      fz_pop_clip(ctx, dc->dev);
   return 1;
 }
 
@@ -1226,7 +1273,7 @@ dvi_exec_pdf(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t cur, curs
   { return pdf_btrans(dc, st, cur, lim); }
 
   ("endtransform" | "etrans" | "et")
-  { return pdf_etrans(dc, st); }
+  { return pdf_etrans(ctx, dc, st); }
 
   @f0 ("bcontent" | "econtent") @f1
   {
@@ -1269,6 +1316,14 @@ bool dvi_exec_special(fz_context *ctx, dvi_context *dc, dvi_state *st, cursor_t 
   cursor_t mar, i, j;
 
   // fprintf(stderr, "special: %.*s\n", (int)(lim - cur), cur);
+
+  // x:gsave and x:grestore, which xetex.def puts around the clip of a PDF
+  // picture cut by \includegraphics[clip]: q and Q.
+  static const char q[] = "q", Q[] = "Q";
+  if (pdf_keyword(cur, lim, "x:gsave") == lim)
+    return pdf_code(ctx, dc, st, q, q + 1);
+  if (pdf_keyword(cur, lim, "x:grestore") == lim)
+    return pdf_code(ctx, dc, st, Q, Q + 1);
 
   for (;;)
   {
