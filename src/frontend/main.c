@@ -1191,6 +1191,20 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
     size_t len = strlen(ui->export_path);
     bool sixel = len > 4 && strcmp(ui->export_path + len - 4, ".six") == 0;
     fz_rect b = fz_bound_display_list(ctx, dl);
+    // With crop on (the `crop' command), the page is cut to what is drawn
+    // on it, a little room left around: its white margins go.
+    if (txp_renderer_get_config(ctx, ui->doc_renderer)->crop)
+    {
+      fz_rect c = fz_empty_rect;
+      dev = fz_new_bbox_device(ctx, &c);
+      fz_run_display_list(ctx, dl, dev, fz_identity, b, NULL);
+      fz_close_device(ctx, dev);
+      fz_drop_device(ctx, dev);
+      dev = NULL;
+      c = fz_intersect_rect(b, fz_expand_rect(c, 6));
+      if (!fz_is_empty_rect(c))
+        b = c;
+    }
     float bw = b.x1 - b.x0, bh = b.y1 - b.y0;
     if (bw <= 0 || bh <= 0)
       fz_throw(ctx, FZ_ERROR_GENERIC, "empty page");
@@ -1503,6 +1517,9 @@ static void interpret_command(struct persistent_state *ps,
           txp_renderer_get_config(ps->ctx, ui->doc_renderer);
       config->crop = !config->crop;
       schedule_event(RENDER_EVENT);
+      // The editor's page is cut to its contents too: write it again.
+      if (ui->export_path && ui->export_dl)
+        export_page(ps, ui, ui->export_dl);
     }
     break;
     case EDIT_INVERT:
