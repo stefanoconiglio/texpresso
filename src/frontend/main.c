@@ -130,7 +130,23 @@ typedef struct {
   int sel_count, sel_page;
   // Thumbnails of every page (thumbnails): TeX goes on to the end meanwhile
   bool want_all;
+  // The pictures asked for, written a few pages per turn of the main loop
+  // (thumbs_next, -1 when none is being written) so that commands and TeX
+  // keep their turn; pages [0, thumbs_valid) are written in thumbs_dir at
+  // this size and unchanged since (a rollback lowers the page count, and
+  // with it thumbs_valid): they are announced again, not drawn again.
+  char *thumbs_dir;
+  int thumbs_width, thumbs_height;
+  int thumbs_next, thumbs_valid, thumbs_cap;
+  int *thumbs_size;             // per page written: its width and height
 } ui_state;
+
+// Pages from the lowest count seen on may have changed: their pictures too.
+static void thumbs_observe(ui_state *ui, int page_count)
+{
+  if (ui->thumbs_valid > page_count)
+    ui->thumbs_valid = page_count;
+}
 
 /* UI rendering */
 
@@ -189,6 +205,18 @@ static bool need_advance(fz_context *ctx, ui_state *ui)
   return need;
 }
 
+// Whether TeX has yet to give the page on display, or the place SyncTeX asks.
+static bool display_waits(ui_state *ui)
+{
+  if (send(get_status, ui->eng) != DOC_RUNNING)
+    return false;
+  if (send(page_count, ui->eng) <= ui->page)
+    return true;
+  fz_buffer *buf;
+  synctex_t *stx = send(synctex, ui->eng, &buf);
+  return synctex_has_target(stx);
+}
+
 static bool advance_engine(fz_context *ctx, ui_state *ui)
 {
   bool need = need_advance(ctx, ui);
@@ -206,6 +234,7 @@ static bool advance_engine(fz_context *ctx, ui_state *ui)
   {
     if (!send(step, ui->eng, ctx, false))
       break;
+    thumbs_observe(ui, send(page_count, ui->eng));
 
     steps -= 1;
     need = need_advance(ctx, ui);
@@ -1274,22 +1303,58 @@ static void export_page(struct persistent_state *ps, ui_state *ui, fz_display_li
 }
 
 // Write each page typeset as dir/page-N.png, fitted to width x height and
-// in the theme's colours, and tell the editor of each and of the count.
-static void export_thumbnails(struct persistent_state *ps, ui_state *ui,
-                              const char *dir, int width, int height)
+// in the theme's colours, and tell the editor of each and of the count: a
+// few pages a turn, for about 15 ms, the pages unchanged since they were
+// written announced without drawing them again.  True while pages are left.
+static bool export_thumbnails_step(struct persistent_state *ps, ui_state *ui)
 {
+  if (ui->thumbs_next < 0)
+    return false;
   fz_context *ctx = ps->ctx;
   int count = send(page_count, ui->eng);
+  thumbs_observe(ui, count);
+  if (count > ui->thumbs_cap)
+  {
+    int cap = fz_maxi(count, 2 * ui->thumbs_cap);
+    int *sizes = realloc(ui->thumbs_size, sizeof(int) * 2 * cap);
+    if (!sizes)
+    {
+      ui->thumbs_next = -1;
+      return false;
+    }
+    ui->thumbs_size = sizes;
+    ui->thumbs_cap = cap;
+  }
+  const char *dir = ui->thumbs_dir;
+  int width = ui->thumbs_width, height = ui->thumbs_height;
   fz_buffer *sbuf = NULL;
   synctex_t *stx = send(synctex, ui->eng, &sbuf);
-  for (int page = 0; page < count; ++page)
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  int page;
+  for (page = ui->thumbs_next; page < count; ++page)
   {
-    fz_display_list *dl = NULL;
-    fz_pixmap *pix = NULL;
-    fz_device *dev = NULL;
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed = (now.tv_sec - start.tv_sec) * 1000000000L + (now.tv_nsec - start.tv_nsec);
+    if (page > ui->thumbs_next && elapsed > 15000000L)
+      break;
     char path[1024], tmp[1040];
     snprintf(path, sizeof(path), "%s/page-%d.png", dir, page);
     snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    const char *src = NULL;
+    int src_len = 0, src_line = 0;
+    if (page < ui->thumbs_valid)
+    {
+      if (!synctex_page_source(ctx, stx, sbuf, page, &src, &src_len, &src_line))
+        src = NULL;
+      editor_thumbnail(path, page, ui->thumbs_size[2 * page], ui->thumbs_size[2 * page + 1],
+                       ps->doc_path, src, src_len, src_line);
+      continue;
+    }
+    fz_display_list *dl = NULL;
+    fz_pixmap *pix = NULL;
+    fz_device *dev = NULL;
     fz_var(dl);
     fz_var(pix);
     fz_var(dev);
@@ -1313,8 +1378,10 @@ static void export_thumbnails(struct persistent_state *ps, ui_state *ui,
       fz_save_pixmap_as_png(ctx, pix, tmp);
       if (rename(tmp, path) != 0)
         fz_throw(ctx, FZ_ERROR_GENERIC, "cannot rename %s: %s", tmp, strerror(errno));
-      const char *src = NULL;
-      int src_len = 0, src_line = 0;
+      ui->thumbs_size[2 * page] = pw;
+      ui->thumbs_size[2 * page + 1] = ph;
+      if (page == ui->thumbs_valid)
+        ui->thumbs_valid = page + 1;
       if (!synctex_page_source(ctx, stx, sbuf, page, &src, &src_len, &src_line))
         src = NULL;
       editor_thumbnail(path, page, pw, ph, ps->doc_path, src, src_len, src_line);
@@ -1330,8 +1397,14 @@ static void export_thumbnails(struct persistent_state *ps, ui_state *ui,
       fprintf(stderr, "[thumbnails] page %d: %s\n", page, fz_caught_message(ctx));
     }
   }
+  if (page < count)
+  {
+    ui->thumbs_next = page;
+    return true;
+  }
+  ui->thumbs_next = -1;
   editor_thumbnails_done(count, send(get_status, ui->eng) != DOC_RUNNING);
-  fflush(stdout);
+  return false;
 }
 
 static void display_page(struct persistent_state *ps, ui_state *ui)
@@ -1434,6 +1507,7 @@ static void interpret_command(struct persistent_state *ps,
       // the new colours (the window above repaints by itself).
       if (ui->export_path && ui->export_dl)
         export_page(ps, ui, ui->export_dl);
+      ui->thumbs_valid = 0;
     }
     break;
 
@@ -1528,6 +1602,7 @@ static void interpret_command(struct persistent_state *ps,
           txp_renderer_get_config(ps->ctx, ui->doc_renderer);
       config->invert_color = !config->invert_color;
       schedule_event(RENDER_EVENT);
+      ui->thumbs_valid = 0;
     }
     break;
 
@@ -1583,9 +1658,19 @@ static void interpret_command(struct persistent_state *ps,
     case EDIT_THUMBNAILS:
     {
       ui->want_all = cmd.thumbnails.dir[0] != 0;
-      if (ui->want_all && cmd.thumbnails.width > 0 && cmd.thumbnails.height > 0)
-        export_thumbnails(ps, ui, cmd.thumbnails.dir,
-                          cmd.thumbnails.width, cmd.thumbnails.height);
+      if (!ui->want_all || !ui->thumbs_dir || strcmp(ui->thumbs_dir, cmd.thumbnails.dir) != 0 ||
+          ui->thumbs_width != cmd.thumbnails.width || ui->thumbs_height != cmd.thumbnails.height)
+      {
+        // another folder or size: no picture written is of use
+        free(ui->thumbs_dir);
+        ui->thumbs_dir = ui->want_all ? strdup(cmd.thumbnails.dir) : NULL;
+        ui->thumbs_width = cmd.thumbnails.width;
+        ui->thumbs_height = cmd.thumbnails.height;
+        ui->thumbs_valid = 0;
+      }
+      ui->thumbs_next = -1;
+      if (ui->want_all && ui->thumbs_dir && cmd.thumbnails.width > 0 && cmd.thumbnails.height > 0)
+        ui->thumbs_next = 0;
       fprintf(stderr, "[command] thumbnails %s %dx%d\n",
               ui->want_all ? cmd.thumbnails.dir : "(off)",
               cmd.thumbnails.width, cmd.thumbnails.height);
@@ -1707,6 +1792,14 @@ bool texpresso_main(struct persistent_state *ps)
   ui->export_dl = NULL;
   ui->sel_count = 0;
   ui->sel_page = -1;
+  // TeX goes to the end only while the editor wants every page's picture
+  ui->want_all = false;
+  ui->thumbs_dir = NULL;
+  ui->thumbs_width = ui->thumbs_height = 0;
+  ui->thumbs_next = -1;
+  ui->thumbs_valid = 0;
+  ui->thumbs_cap = 0;
+  ui->thumbs_size = NULL;
 
   bool using_texlive = 0;
 
@@ -1865,6 +1958,7 @@ bool texpresso_main(struct persistent_state *ps)
 
     if (send(end_changes, ui->eng, ps->ctx))
     {
+      thumbs_observe(ui, send(page_count, ui->eng));
       if (!ps->paused)
         send(step, ui->eng, ps->ctx, true);
       schedule_event(RELOAD_EVENT);
@@ -1877,6 +1971,13 @@ bool texpresso_main(struct persistent_state *ps)
       bool advance = !ps->paused && advance_engine(ps->ctx, ui);
       send(finish_convergence, ui->eng, ps->ctx);
       int after_page_count = send(page_count, ui->eng);
+      thumbs_observe(ui, after_page_count);
+      // the strip's pictures, a few pages a turn, once TeX has given the
+      // page on display (and the place asked by SyncTeX): an edit's page first
+      // (TeX paused, the page will not come: the pictures go on)
+      bool thumbs = ui->thumbs_next >= 0;
+      if (thumbs && (!advance || !display_waits(ui)))
+        thumbs = export_thumbnails_step(ps, ui);
       fflush(stdout);
 
       if (ui->page >= before_page_count && ui->page < after_page_count)
@@ -1898,7 +1999,7 @@ bool texpresso_main(struct persistent_state *ps)
 
       if (!has_event)
       {
-        if (advance)
+        if (advance || thumbs)
           continue;
         if (!stdin_eof)
           wakeup_poll_thread(poll_stdin_pipe, 'c');
